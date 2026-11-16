@@ -1,5 +1,35 @@
 # HEROLTE (Galaxy S7 SM-G930F, Exynos 8890): progreso
 
+## 2026-11-16: first rear-camera trial, missing C3 stream enable (0347)
+
+- Recovered console after the Bluetooth fix: bridge traffic reaches 14,524
+  bytes to the chip and 36,429 to iOS, with no lost bytes or resyncs. LE
+  advertising-report subevent `le02` reaches 431. This establishes observed
+  BLE advertising traffic; pairing and application data remain unverified.
+- Rear mode 7: C3 ID `0x73c3`, sensor ID `0x0260`, firmware upload CRC
+  `0x537b1be7` matches. Sensor global/extra/mode tables have zero NACKs and
+  output dimensions read back as 2016x1512. Sensor frame counter reaches 35,
+  but CSIS0 counts zero frames; DPHY_STATUS `0xf1` (all stop-state bits),
+  DMA byte count zero and both sentinel-filled buffers unchanged. No frame
+  file exists; stages 1-4 pass and stage 5 fails. Evidence is retained in
+  `s7-port-work/diagnostics/bt-rcam-first/console.txt` outside Git.
+- Missing sequence identified by LLVM Thumb disassembly of the phone's ISP
+  firmware, SHA-256 `a5a1f0b9243b5ee73243535538848dc973eeb73425c35e6ae0e5995d56473f86`:
+  `C73C3_StreamOn` at `0x8354e` writes 16-bit `0x6800 = 1` via `0x12aeb6`;
+  `C73C3_StreamOff` at `0x83620` writes zero. Names are linked through literal
+  pointers `0x838e4 -> 0x1d7179` and `0x83944 -> 0x1d7188`. Existing code only
+  enables the sensor. REA opened the raw target but its required Ghidra
+  engine is unconfigured; these are LLVM observations, not REA decompilation.
+- 0347 adds C3 enable after receiver setup and before sensor start, logs ACK
+  and readback, unwinds on a failed enable, and disables C3 during stop. It
+  also refuses to start unverified firmware after a CRC mismatch. Patch apply
+  check passes and the applied file equals the locally syntax-checked source
+  (1 file, zero failed). Focused disassembly is retained outside Git.
+- Next: CI build 0347, install BOOT with the already working Bluetooth ADT,
+  retain the current drop/runtime, then inspect a fresh device log/frame.
+  The missing command is a concrete difference; runtime resolution remains
+  unproven until that trial.
+
 ## 2026-11-16: current SM-G930S installation follow-up
 
 - User reports the first iOS boot reached the home screen and touch works,

@@ -1,0 +1,62 @@
+From: FlightPulse port follow-up
+Subject: [PATCH] herolte: start and stop the C3 companion's video output
+
+First device trial: firmware CRC matches, sensor frame count advances, but
+CSIS0 sees no frames and all D-PHY lanes remain in stop state. Samsung's
+fimc_is_fw2_imx260.bin (SHA-256 a5a1f0b9243b5ee73243535538848dc973eeb73425c35e6ae0e5995d56473f86)
+identifies C73C3_StreamOn at 0x8354e and C73C3_StreamOff at 0x83620. Both
+use the 16-bit register writer at 0x12aeb6: 0x6800 = 1 / 0 respectively.
+Apply the missing enable after receiver setup and before sensor streaming;
+log the ACK/readback and unwind if either stream-enable write fails.
+Stop the companion along with the sensor. Fail stage 3 on a CRC mismatch.
+Firmware evidence is LLVM Thumb disassembly, not recovered source. Keep
+firmware and device captures outside Git. Runtime result remains untested.
+
+--- a/bsd/dev/herolte_rcam.c
++++ b/bsd/dev/herolte_rcam.c
+@@ -1084,6 +1084,10 @@
+ 		    rc_fw_len, ver, ns / 1000000, engine ? "" : "(engine timed out) ", got, want,
+ 		    crc_ok ? (got == want ? "MATCH" : "match with bytes swapped") : "MISMATCH");
+ 	}
++	if (!crc_ok) {
++		printf("rcam: stage 3: firmware CRC not verified: stopped before ARM go\n");
++		return false;
++	}
+ 	printf("rcam: stage 3: skipped as in no Samsung calibration: fimc_is_comp_loadcal (rear/front LSC, PDAF shading "
+ 	    "from the camera FROM), the cal CRC checks, power binning (BUCK2 stays 0.8 V), C3_CSI_ERROR_RECOVERY (EVT0 only)\n");
+ 	rc_spi_wr16(0x6048, 0x0001);                    /* ARM reset & memory remap */
+@@ -1352,6 +1356,9 @@
+ rc_stream_down(void)
+ {
+ 	rc_sensor_wr8(0x0100, 0x00);
++	/* Samsung ISP C73C3_StreamOff (0x83620) writes 0x6800 = 0 as well. */
++	bool off = rc_comp_i2c_wr(0x6800, 0x0000);
++	printf("rcam: companion stream off (0x6800 = 0): %s\n", off ? "ok" : "NACK");
+ 	delay(50000);
+ 	rc_rx_down();
+ 	rc_streaming = false;
+@@ -1547,8 +1554,24 @@
+ 	    rc_rd(rc_csis, 0x44), rc_rd(rc_csis, 0x10), rc_rd(rc_csis, 0x18), rc_rd(rc_csis, 0x1000), rc_rd(rc_csis, 0x1004),
+ 	    rc_rd(rc_csis, 0x1010), rc_rd(rc_csis, 0x1014));
+ 	uint32_t f0 = rc_rd(rc_csis, 0x100);
++	/* Samsung ISP C73C3_StreamOn (0x8354e) writes 0x6800 = 1. The
++	 * sensor's 0x0100 alone advances its counter without enabling C3 output.
++	 * Arm the receiver first, then the companion, before starting the sensor. */
+ 	rc_streaming = true;
++	bool comp_on = rc_comp_i2c_wr(0x6800, 0x0001);
++	int comp_ctrl = rc_comp_i2c_rd(0x6800);
++	printf("rcam: stage 5: companion stream on (0x6800 = 1): %s; readback %#x\n",
++	    comp_on ? "ok" : "NACK", (unsigned)comp_ctrl);
++	if (!comp_on) {
++		rc_stream_down();
++		return false;
++	}
+ 	bool on = rc_sensor_wr8(0x0100, 0x01);
++	if (!on) {
++		printf("rcam: stage 5: sensor stream on NACK: stopped\n");
++		rc_stream_down();
++		return false;
++	}
+ 	uint64_t t0 = mach_absolute_time();
+ 	printf("rcam: stage 5: stream on (0x0100 = 1): %s; FRM_CNT_CH0 %u before\n", on ? "ok" : "NACK", f0);
+ 	uint32_t f = f0;
