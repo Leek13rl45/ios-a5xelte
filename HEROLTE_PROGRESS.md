@@ -1,5 +1,24 @@
 # HEROLTE (Galaxy S7 SM-G930F, Exynos 8890): progreso
 
+## 2026-11-17: 0353 built, readback verified and rebooted for comparison
+
+- ARM64 CI 43919249542 at e8dd573 passed, including the Cortex-A53
+  no-LSE check. Artifact hashes and expected kernel markers verified.
+  Kernel SHA256 13db7c14c70a98e7aec6af7bbd962526da16cb88fd667822e2773bd10217f5e4;
+  the working Bluetooth/ISP ADT is unchanged.
+- Backed up the complete installed 40 MiB BOOT and actual baseline drop,
+  then installed the guarded timed 0353 candidate and fresh runtime drop.
+  Both device readback hashes match. BOOT SHA256
+  8760234a71ade5e525dddf68d33e1916efa05f1c1ec6e95e095d3d4e95a30578;
+  herosuse=1, 420-second automatic recovery, no herobot or app/shutter test.
+  Actual reboot requested 2026-11-16 17:43:41 UTC (02:43:41 KST).
+- This trial runs the real shared-use API regression and compares the same
+  existing IMG_0003 HEIC decode in two fresh processes. It retains original
+  photographs and records CPU snapshots, with live log streams disabled.
+  Read-only recovery pull awaits diagnostics/surface-use-0353/.
+- Build/install success is established; boot, API and image results are
+  pending. Normal untimed handback remains outstanding.
+
 ## 2026-11-17: 0352 baseline recovered; 0353 building on ARM runner
 
 - The Intel job 43917355519 remained queued for over eleven minutes and
