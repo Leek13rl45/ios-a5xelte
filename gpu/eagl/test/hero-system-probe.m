@@ -28,6 +28,7 @@
 
 extern char **environ;
 static pid_t detail_logger = -1;
+static pid_t perf_logger = -1;
 
 static int
 signal_process(const char *name, int signal)
@@ -184,7 +185,10 @@ open_weather(void)
 	 * request state. The user's saved cities and settings stay intact. */
 	restart_process("weatherd");
 	restart_process("Weather");
-	open_application(@"com.apple.weather");
+	for (unsigned attempt = 0; attempt < 6; attempt++) {
+		if (open_application(@"com.apple.weather")) break;
+		if (attempt < 5) sleep(5);
+	}
 }
 
 static void
@@ -323,6 +327,11 @@ configure_timezone(void)
 			printf("hero-system-probe: timezone: link update failed: %s\n", strerror(errno));
 			unlink(temporary);
 			return;
+		}
+		if (perf_logger > 0) {
+			int status = 0;
+			waitpid(perf_logger, &status, 0);
+			printf("hero-system-probe: CPU observation status %#x\n", status);
 		}
 		sync();
 	}
@@ -610,6 +619,45 @@ configure_camera(void)
 	printf("hero-system-probe: Camera preference child timed out\n");
 }
 
+static void
+probe_surface_use(void)
+{
+	if (!getenv("HERO_PROBE_SURFACE_USE")) return;
+	posix_spawn_file_actions_t actions;
+	posix_spawn_file_actions_init(&actions);
+	posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO,
+	    "/private/var/herolte/surface-use.out", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO);
+	char *args[] = { "/private/var/herolte/hero-surface-use-probe", NULL };
+	pid_t child = -1;
+	int error = posix_spawn(&child, args[0], &actions, NULL, args, environ);
+	posix_spawn_file_actions_destroy(&actions);
+	if (error) { printf("hero-system-probe: surface use spawn %d\n", error); return; }
+	int status = 0;
+	BOOL finished = NO;
+	for (unsigned i = 0; i < 100; i++) {
+		if (waitpid(child, &status, WNOHANG) == child) { finished = YES; break; }
+		usleep(100000);
+	}
+	if (!finished) { kill(child, SIGKILL); waitpid(child, &status, 0); }
+	printf("hero-system-probe: surface use status %#x timeout %d\n", status, !finished);
+}
+
+static void
+start_perf_logger(void)
+{
+	if (!getenv("HERO_PROBE_PERF")) return;
+	posix_spawn_file_actions_t actions;
+	posix_spawn_file_actions_init(&actions);
+	posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO,
+	    "/private/var/herolte/perf.out", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO);
+	char *args[] = { "/private/var/herolte/hero-perf", "240", NULL };
+	int error = posix_spawn(&perf_logger, args[0], &actions, NULL, args, environ);
+	posix_spawn_file_actions_destroy(&actions);
+	printf("hero-system-probe: CPU observation spawn %d pid %d\n", error, perf_logger);
+}
+
 /* Compare ImageIO decoding in fresh processes, preserving the source file.
  * Decoder registration is confined to the experimental second child. */
 static void
@@ -654,6 +702,8 @@ main(int argc, char **argv)
 		setvbuf(stdout, NULL, _IOLBF, 0);
 		configure_camera();
 		configure_timezone();
+		start_perf_logger();
+		probe_surface_use();
 		printf("hero-system-probe: epoch %.0f, UTC %s\n", [NSDate date].timeIntervalSince1970,
 		    [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]].UTF8String);
 		char *args[] = { "/private/var/herolte/hero-oslog", NULL };

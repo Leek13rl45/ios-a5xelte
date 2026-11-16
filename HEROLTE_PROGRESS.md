@@ -1,5 +1,33 @@
 # HEROLTE (Galaxy S7 SM-G930F, Exynos 8890): progreso
 
+## 2026-11-17: current-kernel UI/Weather baseline running during 0353 CI
+
+- 0353 CI 43917355519 at e8dd573 was submitted 17:20:35 UTC and is queued.
+  Private finish-build.py watches it; no 0353 artifact/install exists yet.
+- Added an opt-in real IOSurface protocol regression: nested local use
+  counts, shared IsInUse visibility, a second process using the same ID,
+  and cleanup after that child is killed without decrementing. This tests
+  the actual framework/kernel API, not a duplicate arithmetic model.
+- Added read-only process CPU snapshots (top 8 every five seconds), with
+  100% meaning one core. Uses matching 96-byte PROC_PIDTASKINFO and compares
+  Mach-tick CPU deltas with mach_absolute_time; this XNU's fill_taskprocinfo
+  returns Mach ticks, so assuming nanoseconds would misreport S7 usage.
+  No process priorities or frequencies are changed by the observer.
+- Weather launch now retries six bounded attempts, keeping composed logs
+  around the attempts. Still requires actual launch/forecast validation.
+  New diagnostic helpers/probe compile with warnings as errors and are signed.
+- While CI queues/builds, installed a current-0352-kernel baseline with
+  420-second recovery, 340-second primary Weather logging, 180-second detail
+  logging and a 400-second parent watchdog. BOOT
+  fed580590c12b388b19dcb79773eae4ff57413c7e150d98b5ae360765cca3d1e;
+  predecessor was the verified HEIC/Weather trial. Readback checks pass.
+  Actual reboot request 2026-11-16 17:25:55 UTC (Nov 17 02:25:55 KST).
+- This baseline does NOT contain the new shared-use fix, has no automated
+  shutter/touch input, and preserves saved photos. Runtime files in
+  surface-use-0353/baseline/; recovery evidence will be
+  diagnostics/surface-use-baseline/. User home-scroll/Weather observation
+  and the API/CPU logs are pending. Untimed handback remains outstanding.
+
 ## 2026-11-17: direct phone decode corrupt; shared IOSurface-use protocol missing (0353)
 
 - Focused trial returned; diagnostics/heic-weather-0352/ recovered. Both
