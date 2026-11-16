@@ -27,7 +27,7 @@
 #include "../../camera/hakios.camera.h"
 
 extern char **environ;
-static pid_t weather_logger = -1;
+static pid_t detail_logger = -1;
 
 static int
 signal_process(const char *name, int signal)
@@ -53,10 +53,11 @@ restart_process(const char *name)
 	(void)signal_process(name, SIGKILL);
 }
 
-static void
+static BOOL
 open_application(NSString *bundle)
 {
-	dlopen("/System/Library/Frameworks/CoreServices.framework/CoreServices", RTLD_NOW);
+	dlopen("/System/Library/Frameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_LAZY);
+	dlopen("/System/Library/Frameworks/CoreServices.framework/CoreServices", RTLD_LAZY);
 	Class cls = NSClassFromString(@"LSApplicationWorkspace");
 	SEL workspaceSelector = NSSelectorFromString(@"defaultWorkspace");
 	id workspace = [cls respondsToSelector:workspaceSelector] ?
@@ -64,7 +65,8 @@ open_application(NSString *bundle)
 	SEL open = NSSelectorFromString(@"openApplicationWithBundleID:");
 	BOOL ok = [workspace respondsToSelector:open] &&
 	    ((BOOL (*)(id, SEL, id))objc_msgSend)(workspace, open, bundle);
-	printf("hero-system-probe: open %s %s\n", bundle.UTF8String, ok ? "accepted" : "unavailable");
+	printf("hero-system-probe: open %s %s (workspace %d)\n", bundle.UTF8String, ok ? "accepted" : "unavailable", workspace != nil);
+	return ok;
 }
 
 static void
@@ -93,8 +95,8 @@ start_detail_logger(const char *processes, const char *words, const char *path, 
 		    path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 		posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO);
 		char *args[] = { "/private/var/herolte/hero-oslog", NULL };
-		int error = posix_spawn(&weather_logger, args[0], &actions, NULL, args, environment);
-		printf("hero-system-probe: separate decoder spawn %d pid %d\n", error, weather_logger);
+		int error = posix_spawn(&detail_logger, args[0], &actions, NULL, args, environment);
+		printf("hero-system-probe: separate decoder spawn %d pid %d\n", error, detail_logger);
 		posix_spawn_file_actions_destroy(&actions);
 		free(environment);
 	}
@@ -107,9 +109,28 @@ open_photo(void)
 		return;
 	start_detail_logger("Camera,mediaserverd,assetsd,photolibraryd,photoanalysisd",
 	    "error,fail,jpeg,heif,heic,encode,save,photo,stillimage",
-	    "/private/var/herolte/photo-compose.out", 170);
+	    "/private/var/herolte/photo-compose.out", 150);
+	/* App registration is still starting when this probe first runs. */
+	sleep(45);
 	restart_process("Camera");
-	open_application(@"com.apple.camera");
+	for (unsigned attempt = 0; attempt < 9; attempt++) {
+		if (open_application(@"com.apple.camera")) {
+			if (getenv("HERO_PROBE_SHUTTER")) {
+				/* Diagnostic-only virtual volume-down tap. The kernel gates
+				 * synthetic input behind herobot=1 and root. */
+				sleep(15);
+				const char *down = "k 2 1", *up = "k 2 0";
+				int pressed = sysctlbyname("kern.notefe_hid", NULL, NULL, (void *)down, strlen(down));
+				int press_error = pressed ? errno : 0;
+				usleep(150000);
+				int released = sysctlbyname("kern.notefe_hid", NULL, NULL, (void *)up, strlen(up));
+				printf("hero-system-probe: diagnostic shutter key down %d errno %d up %d\n",
+				    pressed, press_error, released);
+			}
+			break;
+		}
+		sleep(5);
+	}
 }
 
 static void
@@ -513,11 +534,11 @@ main(void)
 		sleep(15);
 		network_state();
 		bootstrap_clock(NO);
-		open_photo();
 		check_url(@"https://www.apple.com/library/test/success.html");
 		check_url(@"https://weather-data.apple.com/");
 		/* An HTTP rejection from this unauthenticated endpoint still proves
 		 * DNS/TLS transport. It does not prove Weather's authenticated API works. */
+		open_photo();
 		front_sample();
 		if (!getenv("HERO_PROBE_FRONT") && getenv("HERO_PROBE_NETWORK_WAIT")) {
 			int seconds = atoi(getenv("HERO_PROBE_NETWORK_WAIT"));
@@ -548,9 +569,9 @@ main(void)
 			waitpid(logger, &status, 0);
 			printf("hero-system-probe: logger status %#x\n", status);
 		}
-		if (weather_logger > 0) {
+		if (detail_logger > 0) {
 			int status = 0;
-			waitpid(weather_logger, &status, 0);
+			waitpid(detail_logger, &status, 0);
 			printf("hero-system-probe: separate decoder status %#x\n", status);
 		}
 		sync();

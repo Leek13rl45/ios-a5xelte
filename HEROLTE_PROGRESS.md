@@ -1,5 +1,29 @@
 # HEROLTE (Galaxy S7 SM-G930F, Exynos 8890): progreso
 
+## 2026-11-17: photo-only retry and 0352 CI
+
+- Photo-only 0351 returned automatically; diagnostics/photo-0351/ shows
+  `open com.apple.camera unavailable` and no Camera process/shutter request.
+  Therefore this trial did NOT reproduce the save failure. The isolated
+  composed logger itself completes normally; only audio HAL errors appear.
+- Probe now explicitly loads MobileCoreServices too, delays until app
+  registration progresses, retries opening Camera, and logs whether the
+  workspace exists. Optional HERO_PROBE_SHUTTER sends one volume-down
+  press/release only after a successful app-open reply plus 15 seconds.
+  Synthetic input is kernel-gated by herobot=1 and root; the diagnostic
+  runtime compiles with warnings as errors and is ad-hoc signed.
+- Installed/readback verified photo2 trial BOOT
+  673f176ca4b4fd05b3f2f7d47f81da5f81fab2d42956b9ef6b45b36bd940d528
+  using the SAME 0351 kernel/ADT. The bounded cmdline replaces optional
+  keepsyms=1 with herobot=1; cpus=8 and all functional boot settings remain.
+  Diagnostic-only profile has no automatic RAW sampling or media suspension.
+  Reboot requested 2026-11-16 15:03:08 UTC (Nov 17 00:03:08 KST); evidence
+  will be diagnostics/photo2-0351/. Save success is not established yet.
+- 0352 CI 43891195416 builds 29f209f. Submitted 14:57 UTC, runner started
+  15:02 UTC after queueing; currently compiling. No 0352 phone write yet.
+- Normal handback must remove herobot, automatic key/app tests and the
+  timed recovery boot. Current phone is still an explicitly timed trial.
+
 ## 2026-11-16: native RAW recovered; photo saving and rear autofocus unresolved
 
 - Timed 0351 boot returned to TWRP automatically. Evidence recovered in
