@@ -1412,6 +1412,7 @@ worker(void *context)
 	uint8_t *buffer = NULL;
 	size_t bytes = 0;
 	uint32_t tuned_for = ~0u;
+	int front_bayer = -1;
 	bool switched = false;
 	float lux = -1, cct = -1;
 	struct af af = { 0 };
@@ -1431,6 +1432,19 @@ worker(void *context)
 		close(device);
 		return NULL;
 	}
+	/* Optional board-specific phase test: the 4E6's programmed 180-degree
+	 * readout changes GRBG to GBRG at these even dimensions. Neutral RAW
+	 * alone cannot identify R/B, so keep the override explicit and reversible. */
+	int option = open("/private/var/herolte/cam.front-bayer", O_RDONLY);
+	if (option >= 0) {
+		char text[4] = { 0 };
+		ssize_t n = read(option, text, sizeof(text));
+		close(option);
+		if ((n == 1 || (n == 2 && text[1] == '\n')) && text[0] >= '0' && text[0] <= '3')
+			front_bayer = text[0] - '0';
+	}
+	if (s->camera->sensor == 2 && front_bayer >= 0)
+		say("front Bayer override %d (cam.front-bayer)", front_bayer);
 	isp_init(&isp);
 	while (s->running && failures < 5) {
 		ssize_t n;
@@ -1454,10 +1468,21 @@ worker(void *context)
 					say("the kernel's frames are camera %u's: to %u, the %s", head.sensor, s->camera->sensor, s->camera->name);
 					(void)write(device, &c, sizeof(c));
 				}
+				failures++;
 				continue;
+			}
+			if (memcmp(head.magic, HAKIOS_CAMERA_MAGIC, 8) || head.header_bytes != sizeof(head) ||
+			    head.format != 1 || head.bayer > 3 || head.width < 4 || head.width > 4032 ||
+			    head.height < 2 || head.height > 3024 || head.width % 4 || head.stride != head.width * 5 / 4) {
+				say("invalid camera frame dimensions/header");
+				break;
 			}
 			bytes = sizeof(head) + (size_t)head.stride * head.height;
 			buffer = malloc(bytes);
+			if (!buffer) {
+				say("cannot allocate %zu-byte camera frame", bytes);
+				break;
+			}
 			say("frames of %ux%u from the kernel (the %s)", head.width, head.height, s->camera->name);
 			continue;
 		}
@@ -1472,9 +1497,21 @@ worker(void *context)
 			failures += n < 0 && errno == EAGAIN ? 0 : 1;
 			continue;
 		}
+		struct hakios_camera_frame *f = (void *)buffer;
+		if (memcmp(f->magic, HAKIOS_CAMERA_MAGIC, 8) || f->header_bytes != sizeof(*f) ||
+		    f->sensor != s->camera->sensor || f->width != head.width || f->height != head.height ||
+		    f->stride != head.stride || f->format != 1 || f->bayer > 3) {
+			/* Another reader may have selected a physical source with a
+			 * different size. Never feed a truncated frame into the ISP. */
+			free(buffer);
+			buffer = NULL;
+			switched = false;
+			failures++;
+			continue;
+		}
 		failures = 0;
-
-		const struct hakios_camera_frame *f = (const void *)buffer;
+		if (f->sensor == 2 && front_bayer >= 0)
+			f->bayer = (uint32_t)front_bayer;
 		const uint8_t *raw = buffer + f->header_bytes;
 		struct hakios_camera_command c;
 

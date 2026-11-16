@@ -47,6 +47,29 @@
   fimc-is-cis-imx260.c functions sensor_imx260_cis_calc_again_code/permile and
   cis->bayer_order. Earlier CI 43871557109 is superseded; no 0349 device
   write has happened. The device remains in TWRP on timed 0348.
+- Corrected-kernel CI run 43872733594 at 665dfac is building; the first run
+  was canceled before any device install. Private finish-build.py verifies
+  SHA256SUMS and packages both timed and untimed candidates. Next install
+  script matches the currently installed auth-trial BOOT/drop before writes.
+- Added an opt-in physical rear probe: select sensor 1 before reading, check
+  API capability, header/2016x1512 dimensions and increasing sequences, save
+  12 complete file-backed RAW frames; then explicitly select sensor 2 for
+  the front sample. Legacy delayed rcam.level trial will be disabled (-1),
+  cam.level=8 loads firmware and publishes the device at startup. Camera
+  opens for 30 seconds after the samples; recovery timer stays 240+12 sec.
+- Physical switching can change frame dimensions between readers, so the
+  runtime validates each frame against its allocation before ISP access.
+  Allocation failure and repeated source mismatches stop cleanly.
+- Front color remains a hypothesis to test: the 4E6 CIS declares GR_BG,
+  while this port programs 0x0101=3 (180-degree readout). For even dimensions
+  that can exchange red/blue. Added optional cam.front-bayer (0..3) in the
+  library, with value 2 prepared for the next trial, leaving the kernel's
+  original RAW metadata available for comparison. Neutral ceiling replay
+  gives the expected swapped R/B means/WB gains but cannot establish true
+  red/blue order. User has not seen this setting yet. Full CCM/LSC is absent.
+- Public sensor reference (specific CIS rather than the generic module):
+  https://github.com/exynos8895/android_kernel_samsung_universal8895/blob/lineage-19.1/drivers/media/platform/exynos/fimc-is2/sensor/module_framework/cis/fimc-is-cis-imx260.c
+  and fimc-is-cis-4e6.c in the same directory. Private copies stay outside Git.
 
 ## 2026-11-16: timed test recovered; KST correction ready, charging
 
