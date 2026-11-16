@@ -1,5 +1,44 @@
 # HEROLTE (Galaxy S7 SM-G930F, Exynos 8890): progreso
 
+## 2026-11-17: three HEIC originals valid on host; phone display path isolated
+
+- Recovered TWRP after user replug and native ADB backend restart. Verified
+  TWRP 3.6.2_9-0/herolte. No photo-file or database writes were made.
+  Private evidence: rear-focus-0352/saved-photo-diagnosis/.
+- DCIM contains IMG_0001..0003.HEIC (190528 / 167568 / 151538 bytes), with
+  three asset rows in copied Photos.sqlite+WAL. All three ImageIO host
+  decodes succeed at 4032x3024. Visual inspection shows coherent room/fan
+  images, no rectangular tile scrambling. The image is still soft; this
+  does not establish completed optical-focus calibration.
+- User's attached phone-screen photograph visibly shows repeated/displaced
+  image rectangles. The HEIC originals have 512x512 HEVC tiles. Original
+  capture/encoding/persistence now works, while the phone's decode/display
+  path is faulty. Do not attribute tile scrambling to focus or corrupt
+  stored image data. Matching boot logs include PHFigDecoder async failures
+  and Camera YUV preview-to-BGRA/JPEG thumbnail conversion failures.
+- Mobile-user app launch now succeeds; the synthetic shutter press/release
+  returns 0/0. Kernel logs AK7371 initialization/readback plus actual app AF
+  sweeps and lens positioning. This is stronger than ID-only evidence, but
+  physical sharpness remains incomplete and user confirmation is absent.
+- Added a bounded diagnostic-only ImageIO probe for the existing third
+  original: a full bitmap goes to file-backed storage; second fresh process
+  may register the installed software HEVC decoder only when all exports
+  exist. Registration stays within that child, not system apps/services.
+  Comparing those bitmaps with host decode will separate decoder behavior
+  from Photos rendering. Both children have a 20-second parent deadline;
+  originals and library are preserved.
+- A focused trial also captures all composed Weather/weatherd/Widget/
+  fairplayd log messages for 140 seconds after Wi-Fi/clock refresh, retaining
+  privacy defaults. This extends the old 45-second/error-only capture that
+  missed the JWT request outcome. User still reports manual Weather absent;
+  no forecast success is claimed. Previously seen cloud No-account errors
+  alone do not establish the final forecast failure.
+- Prepared heic-weather/ uses same 0352 kernel/ADT, timed recovery 360 sec,
+  no herobot or synthetic camera capture, 300-second primary logger and
+  350-second parent deadline. New probe builds with warnings as errors.
+  Installer checks the actual mobile-drop predecessor and full BOOT backup.
+  Trial installation/reboot result follows; normal handback still pending.
+
 ## 2026-11-17: user reports a saved photograph with broken display
 
 - User now clarifies that a newly captured photograph appears in Photos,

@@ -173,9 +173,13 @@ open_weather(void)
 {
 	if (!getenv("HERO_PROBE_WEATHER"))
 		return;
-	if (getenv("HERO_WEATHER_COMPOSE"))
-		start_detail_logger("Weather,weatherd", "error,fail,response,status",
-		    "/private/var/herolte/weather-compose.out", 45);
+	if (getenv("HERO_WEATHER_COMPOSE")) {
+		int seconds = getenv("HERO_WEATHER_COMPOSE_SECONDS") ? atoi(getenv("HERO_WEATHER_COMPOSE_SECONDS")) : 45;
+		if (seconds < 1 || seconds > 180) seconds = 45;
+		start_detail_logger("Weather,weatherd,WeatherWidget,fairplayd.H2",
+		    getenv("HERO_WEATHER_COMPOSE_WORDS") ?: "error,fail,response,status",
+		    "/private/var/herolte/weather-compose.out", seconds);
+	}
 	/* Retry after network/clock bootstrap, clearing the daemon's early-boot
 	 * request state. The user's saved cities and settings stay intact. */
 	restart_process("weatherd");
@@ -606,6 +610,39 @@ configure_camera(void)
 	printf("hero-system-probe: Camera preference child timed out\n");
 }
 
+/* Compare ImageIO decoding in fresh processes, preserving the source file.
+ * Decoder registration is confined to the experimental second child. */
+static void
+probe_photo_decode(void)
+{
+	if (!getenv("HERO_PROBE_HEIC")) return;
+	const char *modes[] = { "baseline", "registered" };
+	for (unsigned i = 0; i < 2; i++) {
+		char path[128];
+		snprintf(path, sizeof(path), "/private/var/herolte/decode-%s.out", modes[i]);
+		posix_spawn_file_actions_t actions;
+		posix_spawn_file_actions_init(&actions);
+		posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO);
+		char *args[] = { "/private/var/herolte/hero-photo-decode", (char *)modes[i], NULL };
+		pid_t child = -1;
+		int error = posix_spawn(&child, args[0], &actions, NULL, args, environ);
+		posix_spawn_file_actions_destroy(&actions);
+		if (error) {
+			printf("hero-system-probe: HEIC %s spawn %d\n", modes[i], error);
+			continue;
+		}
+		int status = 0;
+		BOOL finished = NO;
+		for (unsigned waited = 0; waited < 200; waited++) {
+			if (waitpid(child, &status, WNOHANG) == child) { finished = YES; break; }
+			usleep(100000);
+		}
+		if (!finished) { kill(child, SIGKILL); waitpid(child, &status, 0); }
+		printf("hero-system-probe: HEIC %s status %#x timeout %d\n", modes[i], status, !finished);
+	}
+}
+
 int
 main(int argc, char **argv)
 {
@@ -627,10 +664,13 @@ main(int argc, char **argv)
 		sleep(15);
 		network_state();
 		bootstrap_clock(NO);
-		check_url(@"https://www.apple.com/library/test/success.html");
-		check_url(@"https://weather-data.apple.com/");
+		if (!getenv("HERO_PROBE_SKIP_PUBLIC_URLS")) {
+			check_url(@"https://www.apple.com/library/test/success.html");
+			check_url(@"https://weather-data.apple.com/");
+		}
 		/* An HTTP rejection from this unauthenticated endpoint still proves
 		 * DNS/TLS transport. It does not prove Weather's authenticated API works. */
+		probe_photo_decode();
 		open_photo();
 		front_sample();
 		if (!getenv("HERO_PROBE_FRONT") && getenv("HERO_PROBE_NETWORK_WAIT")) {
@@ -654,8 +694,10 @@ main(int argc, char **argv)
 		network_state();
 		bootstrap_clock(YES);
 		printf("hero-system-probe: late UTC %s\n", [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]].UTF8String);
-		check_url(@"https://www.apple.com/library/test/success.html");
-		check_url(@"https://weather-data.apple.com/");
+		if (!getenv("HERO_PROBE_SKIP_PUBLIC_URLS")) {
+			check_url(@"https://www.apple.com/library/test/success.html");
+			check_url(@"https://weather-data.apple.com/");
+		}
 		open_weather();
 		if (error == 0) {
 			int status = 0;
