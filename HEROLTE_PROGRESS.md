@@ -1,5 +1,44 @@
 # HEROLTE (Galaxy S7 SM-G930F, Exynos 8890): progreso
 
+## 2026-11-16: KST verified, preview reaches app, physical rear bridge (0349)
+
+- User reconnected after charging: TWRP 8%, 3.841 V, Charging. Installed
+  kst-next drop with readback verification and retained the timed 0348 BOOT;
+  reboot at 21:31:46 KST. Recovered evidence in diagnostics/kst-0348/.
+  The actual localtime target is now Asia/Seoul and Foundation reports
+  offset +32400. The untimed/daily-use BOOT has not yet been restored.
+- Fresh Camera after media initialization starts its graph, configures the
+  PrimaryScaler pool/handler and delivers 160 frames (zero refused), with
+  mediaserverd footprint around 100 MiB. User confirms visible video but
+  incorrect color; color calibration remains incomplete. Rear is absent:
+  the old HAKIOS_CAMERA_SENSOR command only relabeled front frames.
+- WeatherWidget logs JWT generation followed by AMSFairPlayGetHardwareInfo
+  failure and local-signature failure. Manual-city failure has an additional
+  authentication blocker beyond GPS. Public HTTPS still succeeds. Logger
+  is stable with guarded argument access but lacks decoded format values.
+- Found fairplayd.H2 in the port's disabled list. A bounded comparison drop
+  uses a new job label, preserved MachServices, demand start (KeepAlive off)
+  and a 60-second throttle. Reboot 21:41:49 KST; service executes and exits
+  normally, and Weather requests cached/server data, but forecast success
+  is not established. A 250-line/process quota cuts off late Weather logs;
+  absence of signature errors in that sample is not proof of authentication
+  success. Private current install/evidence: weather-auth-trial/ and
+  diagnostics/weather-auth-trial/. That diagnostic drop and timed 0348 BOOT
+  remain installed; the phone is back in TWRP.
+- 0349 connects SENSOR=1 to the real IMX260/C3 backend; SENSOR=2 to S5K4E6.
+  Lazy opens, serialized source changes and last-close shutdown replace
+  relabeling. Rear live mode is 2016x1512@30, four 6 MiB DMA slots within
+  the existing reserved 36 MiB; stable snapshots are packed into the same
+  120-byte header/MIPI RAW10 ABI. Group-held exposure and Sony gain conversion
+  serve the app's AE commands. No rear autofocus or full color calibration.
+  BGGR follows Samsung's declared module format and still needs scene evidence.
+- Root hero-run preloads the validated companion image before publishing the
+  camera device. The camera library selects the physical source before its
+  first read. Both edited kernel sources pass local cross-compilation, 0349
+  applies to the current 0348 tree, and runtime builds pass (existing MD5
+  deprecation warning only). Live ring/frame bounds and RAW10 packing checked.
+  Full CI and device behavior are pending. User explicitly said to proceed.
+
 ## 2026-11-16: timed test recovered; KST correction ready, charging
 
 - Runtime commit d171c9e and timed 0348 BOOT were installed with backup,

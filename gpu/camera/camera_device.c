@@ -1422,6 +1422,15 @@ worker(void *context)
 		say("no %s (%s): no frames", HAKIOS_CAMERA_DEVICE, strerror(errno));
 		return NULL;
 	}
+	/* Select before the first read: the kernel now switches the physical
+	 * source, rather than relabeling the front sensor's frames. */
+	struct hakios_camera_command select = { .command = HAKIOS_CAMERA_SENSOR,
+	    .a = s->camera->sensor, .b = ~0u };
+	if (write(device, &select, sizeof(select)) != sizeof(select)) {
+		say("cannot select physical sensor %u: %s", s->camera->sensor, strerror(errno));
+		close(device);
+		return NULL;
+	}
 	isp_init(&isp);
 	while (s->running && failures < 5) {
 		ssize_t n;

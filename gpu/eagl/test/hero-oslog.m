@@ -6,7 +6,8 @@
  *
  *   environment: HERO_OSLOG_SECONDS (default 80), HERO_OSLOG_PROCS (comma separated, default
  *   "mediaserverd,audiomxd,springboard,backboardd,autorun"), HERO_OSLOG_WORDS (comma separated, case-insensitive,
- *   default "haptic,actuator,vibrat,vad,chain,route,systemsound"), HERO_OSLOG_MAX (default 300 lines)
+ *   default "haptic,actuator,vibrat,vad,chain,route,systemsound"), HERO_OSLOG_MAX (default 300 lines),
+ *   HERO_OSLOG_MAX_PROCESS (default 0/unlimited; reserve room for later processes)
  *
  * The first use: boot-happrobe, AudioServicesPlaySystemSound(4095) asked three times and mediaserverd never started
  * the audio plug-in's Actuator. OSLogStore (the public API) has no system-wide store on iOS (boot-oslog: nil, no error).
@@ -105,6 +106,7 @@ main(void)
 {
 	@autoreleasepool {
 		int seconds = number("HERO_OSLOG_SECONDS", 80), max = number("HERO_OSLOG_MAX", 300);
+		int processMax = number("HERO_OSLOG_MAX_PROCESS", 0);
 		/* boot-oslog2: 153581 events and none of mediaserverd's matched: every process now ("*"), with a count by process */
 		NSArray *procs = list("HERO_OSLOG_PROCS", "*");
 		NSArray *words = list("HERO_OSLOG_WORDS", "haptic,actuator,vibe,vibrat,systemsound,taptic,4810,hsp");
@@ -128,6 +130,7 @@ main(void)
 		}
 		__block int seen = 0, shown = 0, samples = 0;
 		NSMutableDictionary<NSString *, NSNumber *> *counts = [NSMutableDictionary dictionary];
+		NSMutableDictionary<NSString *, NSNumber *> *shownCounts = [NSMutableDictionary dictionary];
 		__block id stream = nil;
 		NSDateFormatter *clock = [[NSDateFormatter alloc] init];
 		clock.dateFormat = @"HH:mm:ss.SSS";
@@ -182,6 +185,8 @@ main(void)
 					if (!process || !message || (![procs containsObject:@"*"] && ![procs containsObject:process.lowercaseString])) {
 						return;
 					}
+					if (processMax > 0 && [shownCounts[process] intValue] >= processMax)
+						return;
 					/* Retain a few selected-process samples even when a missing
 					 * format database prevents keyword filtering. */
 					if (samples++ < 8)
@@ -222,6 +227,7 @@ main(void)
 					printf("hero-oslog: %s %s [%s] %.600s\n", date ? [clock stringFromDate:date].UTF8String : "-",
 					    process.UTF8String, subsystem ? subsystem.UTF8String : "", message.UTF8String);
 					shown++;
+					shownCounts[process] = @([shownCounts[process] intValue] + 1);
 				}
 			});
 			call1(stream, @"setInvalidationHandler:", ^(NSUInteger reason) {

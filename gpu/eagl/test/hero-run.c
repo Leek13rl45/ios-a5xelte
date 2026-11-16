@@ -1021,6 +1021,34 @@ mg_cache_set(const char *name, CFTypeRef value)
    CFRelease(cache);
 }
 
+/* Root loads the companion image before publishing the camera device, so an
+ * app can select the rear sensor without access to privileged firmware sysctls. */
+static void
+rear_firmware_load(void)
+{
+   static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+   static int loaded;
+   pthread_mutex_lock(&lock);
+   if (loaded) {
+      pthread_mutex_unlock(&lock);
+      return;
+   }
+   FILE *f = fopen(DROP_DIR "rcam-comp.bin", "rb");
+   if (f) {
+      unsigned char *fw = malloc(1024 * 1024);
+      size_t n = fw ? fread(fw, 1, 1024 * 1024, f) : 0;
+      fclose(f);
+      int ok = n && sysctlbyname("kern.herolte_rcam_fw", NULL, NULL, fw, n) == 0;
+      herodrm_log("hero-run: rear camera: companion firmware %zu bytes: %s%s", n, ok ? "loaded" : "NOT loaded: ",
+          ok ? "" : strerror(errno));
+      loaded = ok;
+      free(fw);
+   } else {
+      herodrm_log("hero-run: rear camera: no rcam-comp.bin in the drop");
+   }
+   pthread_mutex_unlock(&lock);
+}
+
 static void *
 devices_start(__unused void *unused)
 {
@@ -1071,6 +1099,7 @@ devices_start(__unused void *unused)
          herodrm_log("hero-run: devices: bluetooth: bluetoothd restarted (%d)", kill_by_name("bluetoothd", SIGKILL));
    }
    if (cam == 8) {
+      rear_firmware_load();
       int seven = 7;
       herodrm_log("hero-run: devices: camera device: %s",
           sysctlbyname("kern.notefe_cam", NULL, NULL, &seven, sizeof(seven)) == 0 ? "made" : "refused");
@@ -1179,18 +1208,7 @@ rcam_start(__unused void *unused)
       herodrm_log("hero-run: rear camera: keep streaming: %s",
           sysctlbyname("kern.herolte_rcam_keep", NULL, NULL, &one, sizeof(one)) == 0 ? "set" : strerror(errno));
    }
-   FILE *f = fopen(DROP_DIR "rcam-comp.bin", "rb");
-   if (f) {
-      unsigned char *fw = malloc(1024 * 1024);
-      size_t n = fw ? fread(fw, 1, 1024 * 1024, f) : 0;
-      fclose(f);
-      int ok = n && sysctlbyname("kern.herolte_rcam_fw", NULL, NULL, fw, n) == 0;
-      herodrm_log("hero-run: rear camera: companion firmware %zu bytes: %s%s", n, ok ? "loaded" : "NOT loaded: ",
-          ok ? "" : strerror(errno));
-      free(fw);
-   } else {
-      herodrm_log("hero-run: rear camera: no rcam-comp.bin in the drop");
-   }
+   rear_firmware_load();
    int err = sysctlbyname("kern.herolte_rcam", NULL, NULL, &level, sizeof(level)) == 0 ? 0 : errno;
    int done = -1;
    size_t len = sizeof(done);

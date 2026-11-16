@@ -1,0 +1,445 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -2777,24 +2777,16 @@
+ #define NC_SW           1304u
+ #define NC_SH           980u
+ #define NC_STRIDE       (NC_SW * 5 / 4)
+-struct nc_cam_frame {
+-	char magic[8];
+-	uint32_t header_bytes, width, height, stride, format, bayer, black;
+-	uint64_t sequence, time;
+-	uint32_t exposure_lines, line_ns, gain, gain_unity, gain_max, frame_lines, frame_lines_min, frame_lines_max, margin;
+-	uint32_t sensor, focus, reserved[5];
+-};
+-struct nc_cam_cmd {
+-	uint32_t command, bytes, a, b, c, d;
+-};
++#include "herolte_camera.h"
++static LCK_GRP_DECLARE(nc_dev_grp, "herolte_camera_device");
++static LCK_MTX_DECLARE(nc_dev_mtx, &nc_dev_grp);
+ static int nc_opens;
+ static bool nc_streaming;
+ static uint32_t nc_last_frm, nc_exp = 1020, nc_gain = 0x20, nc_reads, nc_torn;
+ static uint16_t *nc_copy;               /* 0457: the finished slot copied out at once (reading the uncached ring pixel by pixel
+                                          * took 0.3-0.45 s, and the ring wraps every ~133 ms) */
+ static uint64_t nc_seq, nc_user_exp_until;
+-static uint32_t nc_sensor_id = 2;       /* 0463: the number the frames carry: whatever HAKIOS_CAMERA_SENSOR asked for (one camera
+-                                         * here, so the back and the front streams both get its frames, as on the S9) */
++static uint32_t nc_sensor_id = 2; /* physical sensor selected by HAKIOS_CAMERA_SENSOR */
+ static struct {
+ 	vm_offset_t top, csis, phy, pmu, mmu, cam1, pins;
+ 	uint8_t l5, l6, l7, l13;
+@@ -2969,27 +2961,26 @@
+ static int
+ nc_dev_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
+ {
+-	int error = 0;
+-	if (nc_opens++ == 0) {
+-		error = nc_stream_up();
+-		if (error) {
+-			nc_opens = 0;
+-		}
+-	}
+-	return error;
++	lck_mtx_lock(&nc_dev_mtx);
++	nc_opens++;
++	lck_mtx_unlock(&nc_dev_mtx);
++	return 0;
+ }
+ 
+ static int
+ nc_dev_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
+ {
++	lck_mtx_lock(&nc_dev_mtx);
+ 	if (nc_opens > 0 && --nc_opens == 0) {
+ 		nc_stream_down();
+-	}
++		herolte_rcam_dev_stop();
++	}
++	lck_mtx_unlock(&nc_dev_mtx);
+ 	return 0;
+ }
+ 
+ static int
+-nc_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++nc_front_read(struct uio *uio)
+ {
+ 	if (!nc_streaming) {
+ 		return EIO;
+@@ -3073,6 +3064,24 @@
+ }
+ 
+ static int
++nc_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	lck_mtx_lock(&nc_dev_mtx);
++	int error;
++	if (nc_sensor_id == 1) {
++		error = herolte_rcam_dev_start();
++		if (!error)
++			error = herolte_rcam_dev_read(uio);
++	} else {
++		error = nc_streaming ? 0 : nc_stream_up();
++		if (!error)
++			error = nc_front_read(uio);
++	}
++	lck_mtx_unlock(&nc_dev_mtx);
++	return error;
++}
++
++static int
+ nc_dev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ {
+ 	while (uio_resid(uio) >= (user_ssize_t)sizeof(struct nc_cam_cmd)) {
+@@ -3081,13 +3090,29 @@
+ 		if (error) {
+ 			return error;
+ 		}
+-		if (c.command == 3) {                          /* HAKIOS_CAMERA_SENSOR: taken, the frames carry it */
+-			nc_sensor_id = c.a;
+-		}
+-		if (c.command == 1 && nc_streaming) {           /* HAKIOS_CAMERA_EXPOSURE */
+-			nc_set_exposure(c.a, c.b);
+-			clock_interval_to_deadline(2, NSEC_PER_SEC, &nc_user_exp_until);
+-		}
++		lck_mtx_lock(&nc_dev_mtx);
++		if (c.command == 3) { /* switch the physical source before its next read */
++			if (c.a != 1 && c.a != 2) {
++				error = EINVAL;
++			} else if (nc_sensor_id != c.a) {
++				nc_stream_down();
++				herolte_rcam_dev_stop();
++				nc_sensor_id = c.a;
++				printf("NOTEFE CAM: device switched to physical %s sensor\n", c.a == 1 ? "rear" : "front");
++			}
++		}
++		if (c.command == 1) {
++			if (nc_sensor_id == 1) {
++				error = herolte_rcam_dev_exposure(c.a, c.b);
++			} else if (nc_streaming) {
++				nc_set_exposure(c.a, c.b);
++				clock_interval_to_deadline(2, NSEC_PER_SEC, &nc_user_exp_until);
++			}
++		}
++		lck_mtx_unlock(&nc_dev_mtx);
++		if (error)
++			return error;
++
+ 		uint8_t skipbuf[256];
+ 		for (uint32_t left = c.bytes; left && uio_resid(uio) > 0;) {
+ 			uint32_t n = MIN(left, (uint32_t)sizeof(skipbuf));
+diff --git a/bsd/dev/herolte_rcam.c b/bsd/dev/herolte_rcam.c
+--- a/bsd/dev/herolte_rcam.c
++++ b/bsd/dev/herolte_rcam.c
+@@ -35,9 +35,12 @@
+ #include <mach/mach_time.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/proc.h>
++#include <sys/uio.h>
++#include "herolte_camera.h"
+ #include <string.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t notefe_physmap_cached(uint64_t, uint64_t);
+ extern vm_offset_t notefe_physmap(uint64_t pa, uint64_t len);     /* SweetFramebuffer.cpp (0342), write-combined */
+ 
+ /* ---- addresses (this phone's DTB, hw9.dts; Samsung's S5E8890 pwrcal cmusfr.h for the CMU registers) ---- */
+@@ -73,6 +76,20 @@
+ static uint32_t rc_o_keep, rc_o_mode = 7, rc_o_settle, rc_o_deskew, rc_o_bypass = 0x0099, rc_o_spiswap;
+ static uint8_t *rc_fw;
+ static uint32_t rc_fw_len;
++/* Live mode uses four 6 MiB slots in the existing 36 MiB reserved map. */
++#define RC_LIVE_SLOT 0x600000u
++#define RC_LIVE_BYTES (2016u * 1512u * 2u)
++static bool rc_live;
++static vm_offset_t rc_cached;
++static uint8_t *rc_copy;
++static uint64_t rc_seq;
++static uint32_t rc_frame_seen, rc_exp = 800, rc_gain = 32;
++static uint32_t rc_bayer = 3; /* Samsung's IMX260 module declares SBGGR10; scene verification pending. */
++SYSCTL_UINT(_kern, OID_AUTO, herolte_rcam_bayer, CTLFLAG_RW | CTLFLAG_LOCKED, &rc_bayer, 0,
++    "rear live camera Bayer order: 0 RGGB, 1 GRBG, 2 GBRG, 3 BGGR");
++static int rc_device_api = 1;
++SYSCTL_INT(_kern, OID_AUTO, herolte_rcam_device, CTLFLAG_RD | CTLFLAG_LOCKED, &rc_device_api, 0,
++    "hakios-camera supports a physical rear sensor (SENSOR=1)");
+ static int rc_sleep_ev;
+ 
+ SYSCTL_UINT(_kern, OID_AUTO, herolte_rcam_keep, CTLFLAG_RW | CTLFLAG_LOCKED, &rc_o_keep, 0, "rear camera: 1 keeps streaming after stage 5");
+@@ -1320,9 +1337,9 @@
+ 	rc_wr(c, 0x44, (rc_h << 16) | rc_w);
+ 	/* DMA0_FMT: 2D, normal packing (16 bits a pixel), as the front; ADDR1 = slot 0 (the first frame), ADDR2-8 = slot 1 */
+ 	rc_wr(c, 0x1004, rc_rd(c, 0x1004) & ~(3u << 14));
+-	rc_wr(c, 0x1010, RC_BUF);
+-	for (uint32_t a = 0x1014; a <= 0x102c; a += 4) {
+-		rc_wr(c, a, RC_BUF + RC_SLOT);
++	for (uint32_t i = 0; i < 8; i++) {
++		uint32_t address = rc_live ? RC_BUF + (i & 3) * RC_LIVE_SLOT : RC_BUF + (i ? RC_SLOT : 0);
++		rc_wr(c, 0x1010 + i * 4, address);
+ 	}
+ 	rc_wr(c, 0x1000, (rc_rd(c, 0x1000) & ~1u) | 2u);               /* DMA0 on, pointer update */
+ 	rc_wr(c, 0x14, rc_rd(c, 0x14));                                 /* clear what is pending */
+@@ -1472,6 +1489,27 @@
+ SYSCTL_PROC(_kern, OID_AUTO, herolte_rcam_pic, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+     NULL, 0, rc_pic_sysctl, "S", "rear camera: the captured frame (slot 0, 16 bits a pixel), up to 1 MiB from _pic_off");
+ 
++/* Sony analog gain is 1024/(1024-code); the device ABI uses linear gain /32.
++ * Fixed mode 7 has 1600 lines at the measured 30 fps. */
++static int
++rc_apply_exposure(uint32_t lines, uint32_t gain)
++{
++	lines = MIN(MAX(lines, 4u), 1584u);
++	gain = MIN(MAX(gain, 32u), 512u);
++	uint32_t code = 1024u - 32768u / gain;
++	bool ok = rc_sensor_wr8(0x0104, 1);
++	ok &= rc_sensor_wr8(0x0202, lines >> 8);
++	ok &= rc_sensor_wr8(0x0203, lines & 0xff);
++	ok &= rc_sensor_wr8(0x0204, code >> 8);
++	ok &= rc_sensor_wr8(0x0205, code & 0xff);
++	ok &= rc_sensor_wr8(0x0104, 0);
++	if (!ok)
++		return EIO;
++	rc_exp = lines;
++	rc_gain = gain;
++	return 0;
++}
++
+ static bool
+ rc_capture(void)
+ {
+@@ -1533,9 +1571,10 @@
+ 	rc_rx.saved = true;                             /* from here rc_rx_down() puts it all back */
+ 	rc_pic.valid = false;
+ 	uint32_t fbytes = rc_w * rc_h * 2;
+-	for (uint32_t o = 0; o < fbytes; o += 4) {
+-		*(volatile uint32_t *)(rc_ring + o) = 0xa5a5a5a5u;
+-		*(volatile uint32_t *)(rc_ring + RC_SLOT + o) = 0xa5a5a5a5u;
++	for (uint32_t slot = 0; slot < (rc_live ? 4u : 2u); slot++) {
++		uint32_t stride = rc_live ? RC_LIVE_SLOT : RC_SLOT;
++		for (uint32_t o = 0; o < fbytes; o += 4)
++			*(volatile uint32_t *)(rc_ring + slot * stride + o) = 0xa5a5a5a5u;
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");      /* the pattern in DRAM before the DMA can start */
+ 	/* SysMMU 0x140e0000 to bypass (CTRL_DISABLE), PHY isolation bypass (PMU 0x70c bit 0) and reset released (bit 1),
+@@ -1570,6 +1609,11 @@
+ 	 * sensor's 0x0100 alone advances its counter without enabling C3 output.
+ 	 * Arm the receiver first, then the companion, before starting the sensor. */
+ 	rc_streaming = true;
++	if (rc_live && rc_apply_exposure(rc_exp, rc_gain)) {
++		printf("rcam: live initial exposure not acknowledged\n");
++		rc_stream_down();
++		return false;
++	}
+ 	bool comp_on = rc_comp_i2c_wr(0x6800, 0x0001);
+ 	int comp_ctrl = rc_comp_i2c_rd(0x6800);
+ 	printf("rcam: stage 5: companion stream on (0x6800 = 1): %s; readback %#x\n",
+@@ -1616,20 +1660,24 @@
+ 	uint32_t f1 = rc_rd(rc_csis, 0x100);
+ 	printf("rcam: stage 5: %u frames counted in %llu ms; DMA0 active pointer %u (ADDR1 = slot 0 = the first frame)\n",
+ 	    f1 - f0, ns / 1000000, (rc_rd(rc_csis, 0x1030) >> 2) & 7);
+-	if (!rc_o_keep) {
++	if (!rc_o_keep && !rc_live) {
+ 		rc_stream_down();
+ 	} else {
+ 		printf("rcam: stage 5: kern.herolte_rcam_keep=1: still streaming (stage 0 stops it)\n");
+ 	}
+-	rc_frame_stats("slot 0 (first frame)", rc_ring, fbytes, true);
+-	rc_frame_stats("slot 1 (later frames)", rc_ring + RC_SLOT, fbytes, false);
+-	rc_pic.dma_bytes = dma_bytes;
+-	rc_pic.frames = f1 - f0;
+-	rc_pic.mode = rc_w == 4032 ? 3 : 7;
+-	printf("rcam: stage 5: frame export %s: %u bytes (kern.herolte_rcam_pic_info, kern.herolte_rcam_pic)\n",
+-	    !rc_pic.valid ? "EMPTY" : rc_pic.changed == fbytes ? "complete" : "PARTIAL", rc_pic.bytes);
+-	printf("rcam: stage 5: the frame is at %#x (slot 0) and %#x (slot 1), %u x %u, 16 bits a pixel (RAW10 in 9:0)\n", RC_BUF,
+-	    RC_BUF + RC_SLOT, rc_w, rc_h);
++	if (rc_live) {
++		printf("rcam: live mode 7: four %u-byte slots; %u frames at start\n", RC_LIVE_SLOT, f1 - f0);
++	} else {
++		rc_frame_stats("slot 0 (first frame)", rc_ring, fbytes, true);
++		rc_frame_stats("slot 1 (later frames)", rc_ring + RC_SLOT, fbytes, false);
++		rc_pic.dma_bytes = dma_bytes;
++		rc_pic.frames = f1 - f0;
++		rc_pic.mode = rc_w == 4032 ? 3 : 7;
++		printf("rcam: stage 5: frame export %s: %u bytes (kern.herolte_rcam_pic_info, kern.herolte_rcam_pic)\n",
++		    !rc_pic.valid ? "EMPTY" : rc_pic.changed == fbytes ? "complete" : "PARTIAL", rc_pic.bytes);
++		printf("rcam: stage 5: the frame is at %#x (slot 0) and %#x (slot 1), %u x %u, 16 bits a pixel (RAW10 in 9:0)\n", RC_BUF,
++		    RC_BUF + RC_SLOT, rc_w, rc_h);
++	}
+ 	return f != f0;
+ }
+ 
+@@ -1659,6 +1707,139 @@
+ 	return 0;
+ }
+ 
++/* App-facing rear capture. Called only after the front stream is stopped. */
++static uint32_t rc_previous_mode;
++int
++herolte_rcam_dev_start(void)
++{
++	lck_mtx_lock(&rc_mtx);
++	if (rc_live && rc_streaming) {
++		lck_mtx_unlock(&rc_mtx);
++		return 0;
++	}
++	if (!rc_fw || !rc_fw_len) {
++		printf("rcam: device: companion firmware has not been loaded\n");
++		lck_mtx_unlock(&rc_mtx);
++		return ENOENT;
++	}
++	if (rc_powered)
++		rc_power_off();
++	rc_previous_mode = rc_o_mode;
++	rc_o_mode = 7;
++	rc_live = true;
++	rc_seq = 0;
++	int error = rc_run(5);
++	if (!error) {
++		rc_frame_seen = rc_rd(rc_csis, 0x100);
++		printf("rcam: device: IMX260 live stream ready, 2016x1512\n");
++	} else {
++		rc_power_off();
++		rc_last = 0;
++		rc_live = false;
++		rc_o_mode = rc_previous_mode;
++	}
++	lck_mtx_unlock(&rc_mtx);
++	return error;
++}
++
++void
++herolte_rcam_dev_stop(void)
++{
++	lck_mtx_lock(&rc_mtx);
++	if (rc_live) {
++		rc_power_off();
++		rc_last = 0;
++		rc_live = false;
++		rc_o_mode = rc_previous_mode;
++		printf("rcam: device: stopped after %llu reads\n", rc_seq);
++	}
++	lck_mtx_unlock(&rc_mtx);
++}
++
++int
++herolte_rcam_dev_exposure(uint32_t lines, uint32_t gain)
++{
++	lck_mtx_lock(&rc_mtx);
++	int error = rc_live && rc_streaming ? rc_apply_exposure(lines, gain) : EIO;
++	lck_mtx_unlock(&rc_mtx);
++	return error;
++}
++
++int
++herolte_rcam_dev_read(struct uio *uio)
++{
++	_Static_assert(4 * RC_LIVE_SLOT <= RC_MAP_LEN, "live ring fits reserved camera memory");
++	lck_mtx_lock(&rc_mtx);
++	int error = 0;
++	if (!rc_live || !rc_streaming) {
++		error = EIO;
++		goto out;
++	}
++	bool pixels = uio_resid(uio) > (user_ssize_t)sizeof(struct nc_cam_frame);
++	if (pixels && !rc_copy) {
++		rc_copy = kalloc_data(RC_LIVE_BYTES, Z_WAITOK);
++		if (!rc_copy) {
++			error = ENOMEM;
++			goto out;
++		}
++	}
++	if (!rc_cached)
++		rc_cached = notefe_physmap_cached(RC_BUF, RC_MAP_LEN);
++	uint32_t f = rc_frame_seen, act = 0, slot = 0;
++	bool stable = false;
++	for (unsigned retry = 0; retry < 3 && !stable; retry++) {
++		for (unsigned waited = 0; waited < 500 && f == rc_frame_seen; waited++) {
++			rc_sleep_ms(2);
++			f = rc_rd(rc_csis, 0x100);
++		}
++		if (f == rc_frame_seen) {
++			error = ETIMEDOUT;
++			goto out;
++		}
++		rc_frame_seen = f;
++		act = (rc_rd(rc_csis, 0x1030) >> 2) & 7;
++		slot = ((act + 7) & 7) & 3;
++		if (pixels) {
++			vm_offset_t source = (rc_cached ? rc_cached : rc_ring) + slot * RC_LIVE_SLOT;
++			if (rc_cached)
++				flush_dcache(source, RC_LIVE_BYTES, 0);
++			bcopy((const void *)source, rc_copy, RC_LIVE_BYTES);
++			/* Do not export a snapshot whose slot could have been reused.
++			 * Copy before uiomove, which may fault or sleep in the caller. */
++			stable = rc_rd(rc_csis, 0x100) - f < 3;
++		} else {
++			stable = true;
++		}
++	}
++	if (!stable) {
++		error = EAGAIN;
++		goto out;
++	}
++	struct nc_cam_frame header = {
++		.magic = "RWFRAME1", .header_bytes = sizeof(header), .width = 2016, .height = 1512,
++		.stride = 2520, .format = 1, .bayer = rc_bayer & 3, .black = 64,
++		.sequence = ++rc_seq, .time = mach_absolute_time(), .exposure_lines = rc_exp,
++		.line_ns = 20833, .gain = rc_gain, .gain_unity = 32, .gain_max = 512,
++		.frame_lines = 1600, .frame_lines_min = 1600, .frame_lines_max = 1600, .margin = 16,
++		.sensor = 1, .focus = 0xffffffffu, .reserved = { slot, act, f, 0, 0 }
++	};
++	error = uiomove((caddr_t)&header, (int)MIN(sizeof(header), (size_t)uio_resid(uio)), uio);
++	uint8_t line[2520];
++	for (uint32_t y = 0; !error && pixels && y < 1512 && uio_resid(uio) > 0; y++) {
++		const uint16_t *src = (const uint16_t *)(rc_copy + y * 2016 * 2);
++		for (uint32_t x = 0, o = 0; x < 2016; x += 4, o += 5) {
++			uint16_t a = src[x] & 1023, b = src[x + 1] & 1023, c = src[x + 2] & 1023, d = src[x + 3] & 1023;
++			line[o] = a >> 2; line[o + 1] = b >> 2; line[o + 2] = c >> 2; line[o + 3] = d >> 2;
++			line[o + 4] = (a & 3) | (b & 3) << 2 | (c & 3) << 4 | (d & 3) << 6;
++		}
++		error = uiomove((caddr_t)line, (int)MIN(sizeof(line), (size_t)uio_resid(uio)), uio);
++	}
++out:
++	lck_mtx_unlock(&rc_mtx);
++	return error;
++}
++
++
+ static int
+ rc_sysctl SYSCTL_HANDLER_ARGS
+ {
+@@ -1676,7 +1857,7 @@
+ 	}
+ 	printf("rcam: kern.herolte_rcam=%d by pid %d\n", value, proc_selfpid());
+ 	lck_mtx_lock(&rc_mtx);
+-	error = rc_run(value);
++	error = rc_live ? EBUSY : rc_run(value);
+ 	lck_mtx_unlock(&rc_mtx);
+ 	return error;
+ }
+diff --git a/bsd/dev/herolte_camera.h b/bsd/dev/herolte_camera.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/herolte_camera.h
+@@ -0,0 +1,21 @@
++#ifndef HEROLTE_CAMERA_H
++#define HEROLTE_CAMERA_H
++#include <sys/types.h>
++struct uio;
++/* Shared with gpu/camera/hakios.camera.h; the RAW payload is packed MIPI RAW10. */
++struct nc_cam_frame {
++	char magic[8];
++	uint32_t header_bytes, width, height, stride, format, bayer, black;
++	uint64_t sequence, time;
++	uint32_t exposure_lines, line_ns, gain, gain_unity, gain_max, frame_lines, frame_lines_min, frame_lines_max, margin;
++	uint32_t sensor, focus, reserved[5];
++};
++struct nc_cam_cmd {
++	uint32_t command, bytes, a, b, c, d;
++};
++_Static_assert(sizeof(struct nc_cam_frame) == 120, "camera userspace frame ABI");
++int herolte_rcam_dev_start(void);
++void herolte_rcam_dev_stop(void);
++int herolte_rcam_dev_read(struct uio *);
++int herolte_rcam_dev_exposure(uint32_t, uint32_t);
++#endif
