@@ -32,8 +32,9 @@
   current BOOT and drop were backed up first, and both new readback hashes
   matched. Reboot issued at **19:53:53 KST**. Camera mode 7 / level 5 remains
   selected; sensor and companion stream-enable ACKs now gate capture.
-- User also reports current-location Weather data missing; manual-city
-  Weather and Maps were not checked. Samsung DTB declares a GPS device, but
+- User reports Weather says it is unavailable; manually adding a city also
+  shows no weather (19:57 KST follow-up). GPS absence alone therefore does
+  not explain the reported failure. Maps is not checked. Samsung DTB declares a GPS device, but
   no ported GNSS transport or CoreLocation integration was found (generic
   HID GPS constants are not a driver). `locationd` starts; that alone does
   not establish location fixes. TWRP's 2016 RTC is not proof of iOS's clock:
