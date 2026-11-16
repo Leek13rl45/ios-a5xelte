@@ -38,6 +38,23 @@
   Normal 0349 BOOT candidate SHA-256
   84bad44a60cf56e49a7f6292687c60f9c2625bae96d76b4bb7e6a416a8e67a19
   is prepared but not installed. User authorized continuing the camera work.
+- 0350 CI run 43878704098 at ec1e4fe is building. The runtime now enforces
+  gain_max and frame_lines_max in every AE branch and accepts small hardware
+  gain quantization on readback. Native regression checks cover 960 light
+  levels, 8x/1600-line hardware bounds, quantized acknowledgement and stale
+  frames; they pass. No new 0350 image has been installed yet.
+- Next runtime enables optional cam.front-detail=1: use the existing full
+  demosaic/scaling renderer for front video, rather than upscaling 652x489
+  color cells to the observed 1504x1128 preview. This retains more detail
+  from the 1304x980 input; it does not restore the sensor's native 5 MP mode.
+  Host benchmark at 1504x1128/8 tasks: full ~4.8 ms, production cached-cell
+  path ~1.4 ms. These are Mac results, not S7 speed claims; device timing
+  will be logged. Explicit value 0 disables this option.
+- Probe suspends mediaserverd for RAW capture with a finally-block resume,
+  restores the front selector before closing the rear descriptor, then
+  restarts media for the app. Controlled front captures request 512 lines
+  with gain 32, 64, then 32 again, to compare per-site response under the
+  paired controls. Private files/scripts/binaries: front-pair-0350/.
 
 ## 2026-11-16: KST verified, preview reaches app, physical rear bridge (0349)
 

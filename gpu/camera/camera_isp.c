@@ -217,14 +217,25 @@ isp_measure(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 bool
 isp_ae(struct isp *isp, const struct hakios_camera_frame *f, const struct isp_stats *s, struct hakios_camera_command *c)
 {
+	if (!f->gain_unity || f->gain_max < f->gain_unity || f->frame_lines_min <= f->margin)
+		return false;
 	double now = (double)f->exposure_lines * f->gain / f->gain_unity * isp->digital, ratio, want;
 	double target = 0.15 * WHITE, mean = s->mean[1] * isp->digital > 0.5 ? s->mean[1] * isp->digital : 0.5;
 	double bright = s->bright * isp->digital;
 	uint32_t fast = f->frame_lines_min - f->margin, longest = isp->max_frame_lines ? isp->max_frame_lines : 2 * f->frame_lines_min;
 	uint32_t lines, gain, frame_lines = 0;
 	double digital = 1;
+	if (f->frame_lines_max && longest > f->frame_lines_max)
+		longest = f->frame_lines_max;
+	if (longest < f->frame_lines_min)
+		longest = f->frame_lines_min;
+	double first_gain_limit = fmin(16.0, (double)f->gain_max / f->gain_unity);
 
-	if (isp->asked && (f->exposure_lines != isp->asked_lines || f->gain != isp->asked_gain)) {
+	/* Register encodings (notably Sony reciprocal gain) round the requested
+	 * linear value. A close readback acknowledges the update; exact equality
+	 * can otherwise stop AE permanently after its first quantized command. */
+	if (isp->asked && (fabs((double)f->exposure_lines - isp->asked_lines) > 1 ||
+	    fabs((double)f->gain - isp->asked_gain) > fmax(1.0, isp->asked_gain / 32.0))) {
 		return false;                   /* (the last change not in the frames yet) */
 	}
 	/* (the measured levels are the sensor's: digital gain is applied to the picture only) */
@@ -240,11 +251,11 @@ isp_ae(struct isp *isp, const struct hakios_camera_frame *f, const struct isp_st
 	if (want <= fast) {
 		lines = want < 4 ? 4 : (uint32_t)want;
 		gain = f->gain_unity;
-	} else if (want <= (double)fast * 16) {
+	} else if (want <= (double)fast * first_gain_limit) {
 		lines = fast;
 		gain = (uint32_t)(want / fast * f->gain_unity);
 	} else {
-		lines = (uint32_t)(want / 16);
+		lines = (uint32_t)(want / first_gain_limit);
 		lines = lines > longest - f->margin ? longest - f->margin : lines < fast ? fast : lines;
 		frame_lines = lines + f->margin;
 		double g = want / lines;

@@ -28,21 +28,28 @@
 
 extern char **environ;
 
-static void
-restart_process(const char *name)
+static int
+signal_process(const char *name, int signal)
 {
 	int mib[] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL };
 	size_t size = 0;
 	if (sysctl(mib, 3, NULL, &size, NULL, 0))
-		return;
+		return 0;
 	struct kinfo_proc *processes = malloc(size);
 	int killed = 0;
 	if (processes && !sysctl(mib, 3, processes, &size, NULL, 0))
 		for (size_t i = 0; i < size / sizeof(*processes); i++)
 			if (!strcmp(processes[i].kp_proc.p_comm, name))
-				killed += kill(processes[i].kp_proc.p_pid, SIGKILL) == 0;
+				killed += kill(processes[i].kp_proc.p_pid, signal) == 0;
 	free(processes);
-	printf("hero-system-probe: restart %s: %d\n", name, killed);
+	printf("hero-system-probe: signal %s %d: %d\n", name, signal, killed);
+	return killed;
+}
+
+static void
+restart_process(const char *name)
+{
+	(void)signal_process(name, SIGKILL);
 }
 
 static void
@@ -214,6 +221,16 @@ configure_timezone(void)
 }
 
 static void
+rear_close(int device)
+{
+	/* Other media descriptors may remain open while their process is
+	 * suspended. Release the physical rear source explicitly. */
+	struct hakios_camera_command select = { .command = HAKIOS_CAMERA_SENSOR, .a = 2, .b = ~0u };
+	(void)write(device, &select, sizeof(select));
+	close(device);
+}
+
+static void
 rear_sample(void)
 {
 	if (!getenv("HERO_PROBE_REAR"))
@@ -235,7 +252,7 @@ rear_sample(void)
 		printf("hero-system-probe: rear initialization/header failed: %s, sensor %u %ux%u stride %u\n",
 		    strerror(errno), header.sensor, header.width, header.height, header.stride);
 		if (device >= 0)
-			close(device);
+			rear_close(device);
 		return;
 	}
 	/* File-backed storage avoids another full-frame anonymous allocation in
@@ -268,7 +285,7 @@ rear_sample(void)
 	}
 	if (file >= 0)
 		close(file);
-	close(device);
+	rear_close(device);
 	if (good && rename(part, "/private/var/herolte/rear-sample.rwframe"))
 		good = 0;
 	if (!good)
@@ -278,19 +295,8 @@ rear_sample(void)
 }
 
 static void
-front_sample(void)
+front_capture(void)
 {
-	if (!getenv("HERO_PROBE_FRONT"))
-		return;
-	/* hero-run's rear-camera test starts at 45 s. This probe starts at 20 s;
-	 * wait until it has stopped, then restore its shared resources first. */
-	sleep(45);
-	if (getenv("HERO_PROBE_REAR")) {
-		restart_process("Camera");
-		restart_process("mediaserverd");
-		sleep(3);
-		rear_sample();
-	}
 	int off = 0, level = 7;
 	if (sysctlbyname("kern.herolte_rcam", NULL, NULL, &off, sizeof(off))) {
 		printf("hero-system-probe: rear power-down failed: %s; front sample skipped\n", strerror(errno));
@@ -337,9 +343,52 @@ front_sample(void)
 		}
 		printf("hero-system-probe: front RAW sample %ux%u stride %u Bayer %u, save %s\n",
 		    header.width, header.height, header.stride, header.bayer, result == 0 ? "OK" : "FAILED");
+		if (getenv("HERO_PROBE_FRONT_GAIN")) {
+			const unsigned gains[] = { 32, 64, 32 };
+			const char *paths[] = { "/private/var/herolte/front-gain32.rwframe",
+			    "/private/var/herolte/front-gain64.rwframe", "/private/var/herolte/front-gain32-repeat.rwframe" };
+			for (unsigned phase = 0; phase < 3; phase++) {
+				struct hakios_camera_command control = { .command = HAKIOS_CAMERA_EXPOSURE,
+				    .a = 512, .b = gains[phase], .c = header.frame_lines_min };
+				int saved = -1;
+				if (write(device, &control, sizeof(control)) == sizeof(control)) {
+					for (int settle = 0; settle < 6; settle++)
+						n = read(device, buffer, size);
+					struct hakios_camera_frame *frame = buffer;
+					if (n == (ssize_t)size && frame->sensor == 2 && frame->width == header.width &&
+					    frame->height == header.height && frame->stride == header.stride &&
+					    frame->header_bytes == sizeof(header) && frame->gain == gains[phase] && frame->exposure_lines == 512)
+						saved = save_sample(paths[phase], buffer, size);
+				}
+				printf("hero-system-probe: front gain phase %u request %u/32 exposure 512: %s\n",
+				    phase, gains[phase], saved == 0 ? "saved" : "FAILED");
+			}
+			struct hakios_camera_command restore = { .command = HAKIOS_CAMERA_EXPOSURE,
+			    .a = header.exposure_lines, .b = header.gain, .c = header.frame_lines };
+			(void)write(device, &restore, sizeof(restore));
+		}
 		free(buffer);
 	}
 	close(device);
+}
+
+static void
+front_sample(void)
+{
+	if (!getenv("HERO_PROBE_FRONT"))
+		return;
+	sleep(45);
+	restart_process("Camera");
+	/* Killing media restarts its prewarming readers, which can change the
+	 * global physical source between our header and frame reads. Suspend
+	 * those readers while sampling, then always resume and restart them. */
+	(void)signal_process("mediaserverd", SIGSTOP);
+	@try {
+		rear_sample();
+		front_capture();
+	} @finally {
+		(void)signal_process("mediaserverd", SIGCONT);
+	}
 	restart_process("mediaserverd");
 	if (getenv("HERO_PROBE_CAMERA")) {
 		sleep(8);

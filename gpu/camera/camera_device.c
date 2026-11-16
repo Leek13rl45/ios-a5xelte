@@ -464,6 +464,7 @@ struct stream {
 	CFStringRef     port;
 	bool            af_now;         /* a focus asked for (AutoFocusNow and the like): a search at the next frame */
 	bool            af_locked;      /* LockAFNow: no search but one asked for */
+	bool            front_detail;   /* opt-in full demosaic for front moving previews */
 	float           af_window[4];   /* AFWindowParams: where to focus, as fractions of the frame (x0, y0, x1, y1) */
 	struct output   out[OUTPUTS];
 	pthread_mutex_t lock;
@@ -832,7 +833,7 @@ struct render_job {
 	const uint8_t *raw;
 	CVPixelBufferRef pb;
 	uint32_t format, width, height, pieces;
-	bool still;                     /* the photograph: every pixel of the sensor (isp_render_still_nv12) */
+	bool still;                     /* full demosaic, for photographs or an opted-in detailed preview */
 };
 
 static void
@@ -1043,7 +1044,9 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 	}
 	CVPixelBufferLockBaseAddress(pb, 0);
 
-	struct render_job job = { isp, f, raw, pb, pf, width, height, 8, strcmp(out->name, "StillImage") == 0 && pf != PF_BGRA };
+	bool photograph = strcmp(out->name, "StillImage") == 0;
+	struct render_job job = { isp, f, raw, pb, pf, width, height, 8,
+	    (photograph || (f->sensor == 2 && s->front_detail)) && pf != PF_BGRA };
 	uint64_t began = mach_absolute_time();
 
 	uint32_t cw = 0, ch = 0;
@@ -1070,7 +1073,7 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 	} else {
 		dispatch_apply_f(job.pieces, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &job, render_piece);
 	}
-	if (job.still) {
+	if (job.still && (photograph || out->delivered < 2)) {
 		static mach_timebase_info_data_t tb;
 
 		if (tb.denom == 0) {
@@ -1401,6 +1404,18 @@ load_tuning(struct isp *isp, uint32_t sensor)
 	}
 }
 
+static int
+camera_option(const char *path)
+{
+	char text[4] = { 0 };
+	int fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return -1;
+	ssize_t n = read(fd, text, sizeof(text));
+	close(fd);
+	return (n == 1 || (n == 2 && text[1] == '\n')) && text[0] >= '0' && text[0] <= '3' ? text[0] - '0' : -1;
+}
+
 static void *
 worker(void *context)
 {
@@ -1435,16 +1450,12 @@ worker(void *context)
 	/* Optional board-specific phase test: the 4E6's programmed 180-degree
 	 * readout changes GRBG to GBRG at these even dimensions. Neutral RAW
 	 * alone cannot identify R/B, so keep the override explicit and reversible. */
-	int option = open("/private/var/herolte/cam.front-bayer", O_RDONLY);
-	if (option >= 0) {
-		char text[4] = { 0 };
-		ssize_t n = read(option, text, sizeof(text));
-		close(option);
-		if ((n == 1 || (n == 2 && text[1] == '\n')) && text[0] >= '0' && text[0] <= '3')
-			front_bayer = text[0] - '0';
-	}
+	front_bayer = camera_option("/private/var/herolte/cam.front-bayer");
 	if (s->camera->sensor == 2 && front_bayer >= 0)
 		say("front Bayer override %d (cam.front-bayer)", front_bayer);
+	s->front_detail = s->camera->sensor == 2 && camera_option("/private/var/herolte/cam.front-detail") == 1;
+	if (s->front_detail)
+		say("front preview: full demosaic (cam.front-detail)");
 	isp_init(&isp);
 	while (s->running && failures < 5) {
 		ssize_t n;
@@ -1510,6 +1521,11 @@ worker(void *context)
 			continue;
 		}
 		failures = 0;
+		/* Samsung's IMX260 CIS limits analog code to 0x1c0 (8x). Keep
+		 * app AE within that validated range, even on the initial bridge
+		 * kernel whose generic gain ceiling is wider. */
+		if (f->sensor == 1 && f->gain_max > 256)
+			f->gain_max = 256;
 		if (f->sensor == 2 && front_bayer >= 0)
 			f->bayer = (uint32_t)front_bayer;
 		const uint8_t *raw = buffer + f->header_bytes;
