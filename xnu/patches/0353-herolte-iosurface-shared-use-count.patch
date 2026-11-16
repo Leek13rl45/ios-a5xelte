@@ -1,0 +1,136 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -71,6 +71,8 @@
+ #define SWEET_SURFACE_MAX_PROPS         (64u << 10)
+ #define SWEET_SURFACE_ROW_ALIGN         64
+ #define SWEET_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
++#define SWEET_SURFACE_STATE_USE         0x18    /* two u32 category counts; iOS 16 IOSurfaceClientIsInUse */
++static int sweet_surface_use_enabled;          /* opt-in herosuse=1 while validated on device */
+ #define SWEET_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
+ #define kIOSurfaceLockReadOnly          0x1
+ 
+@@ -115,6 +117,21 @@
+ sweet_surface_seed(SweetSurface *s)
+ {
+ 	return (uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_SEED);
++}
++
++/* A framework client notifies the kernel only at local 0->1 / 1->0
++ * transitions. Track active clients per category in the shared state, not
++ * every local reference. The client map below owns each contribution. */
++static void
++sweet_surface_use_change(SweetSurface *s, unsigned category, bool add)
++{
++	volatile SInt32 *counts = (volatile SInt32 *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_USE);
++	IOLockLock(sweet_surface_lock);
++	if (add)
++		OSIncrementAtomic(&counts[category]);
++	else if (counts[category] > 0)
++		OSDecrementAtomic(&counts[category]);
++	IOLockUnlock(sweet_surface_lock);
+ }
+ 
+ /*
+@@ -386,6 +403,7 @@
+ 	IOMemoryMap  *data;
+ 	IOMemoryMap  *state;
+ 	uint32_t      count;
++	uint8_t       useMask;       /* active use categories owned by this client */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+@@ -399,6 +417,10 @@
+ 	OSSafeReleaseNULL(data);
+ 	OSSafeReleaseNULL(state);
+ 	if (surface != NULL) {
++		for (unsigned category = 0; category < 2; category++)
++			if (useMask & (1u << category))
++				sweet_surface_use_change(surface, category, false);
++		useMask = 0;
+ 		sweet_surface_put(surface);
+ 		surface->release();
+ 		surface = NULL;
+@@ -422,6 +444,10 @@
+ 		return false;
+ 	}
+ 	sweet_surface_init_lock();
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	PE_parse_boot_argn("herosuse", &sweet_surface_use_enabled, sizeof(sweet_surface_use_enabled));
++	IOLog("SWEET SURF: shared use counts %s\n", sweet_surface_use_enabled ? "enabled" : "disabled");
++#endif
+ 	setProperty(kIOUserClientClassKey, "IOSurfaceRootUserClient");
+ 	registerService();
+ 	IOLog("SWEET SURF: IOCoreSurfaceRoot registered\n");
+@@ -453,7 +479,9 @@
+ #endif
+ 	IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
+ 
+-	IOReturn trapUseCount(void *id, void *category, void *, void *, void *, void *);
++	IOReturn changeUseCount(void *id, void *category, bool add);
++	IOReturn trapIncrementUse(void *id, void *category, void *, void *, void *, void *);
++	IOReturn trapDecrementUse(void *id, void *category, void *, void *, void *, void *);
+ 	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
+@@ -576,6 +604,7 @@
+ 	s->retain();
+ 	ref->surface = s;
+ 	ref->count = 1;
++	ref->useMask = 0;
+ 	ref->data = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache);
+ 	ref->state = s->state->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapReadOnly);
+ 	if (ref->data == NULL || ref->state == NULL) {
+@@ -990,10 +1019,37 @@
+ }
+ 
+ IOReturn
+-IOSurfaceRootUserClient::trapUseCount(__unused void *id, __unused void *category,
+-    void *, void *, void *, void *)
+-{
+-	return kIOReturnSuccess;
++IOSurfaceRootUserClient::changeUseCount(void *id, void *category, bool add)
++{
++	if (!sweet_surface_use_enabled)
++		return kIOReturnSuccess;
++	uintptr_t cat = (uintptr_t)category;
++	if (cat >= 2)
++		return kIOReturnBadArgument;
++	IOLockLock(fLock);
++	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, NULL);
++	if (ref != NULL) {
++		uint8_t bit = (uint8_t)(1u << cat);
++		bool held = (ref->useMask & bit) != 0;
++		if (add != held) {
++			sweet_surface_use_change(ref->surface, (unsigned)cat, add);
++			ref->useMask = add ? ref->useMask | bit : ref->useMask & ~bit;
++		}
++	}
++	IOLockUnlock(fLock);
++	return ref != NULL ? kIOReturnSuccess : kIOReturnNotFound;
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapIncrementUse(void *id, void *category, void *, void *, void *, void *)
++{
++	return changeUseCount(id, category, true);
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapDecrementUse(void *id, void *category, void *, void *, void *, void *)
++{
++	return changeUseCount(id, category, false);
+ }
+ 
+ static IOReturn
+@@ -1066,8 +1122,8 @@
+ }
+ 
+ static IOExternalTrap sweet_surface_traps[] = {
+-	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
+-	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
++	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapIncrementUse },
++	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapDecrementUse },
+ 	[kSweetSurfaceTrapLock]          = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapLock },
+ 	[kSweetSurfaceTrapUnlock]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUnlock },
+ 	[kSweetSurfaceTrapRelease]       = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },

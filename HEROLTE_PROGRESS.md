@@ -1,5 +1,43 @@
 # HEROLTE (Galaxy S7 SM-G930F, Exynos 8890): progreso
 
+## 2026-11-17: direct phone decode corrupt; shared IOSurface-use protocol missing (0353)
+
+- Focused trial returned; diagnostics/heic-weather-0352/ recovered. Both
+  full 4032x3024 file-backed phone bitmaps exhibit displaced/stair-stepped
+  512-pixel tiles, while the same original is coherent on the host. Both
+  decoder children exit 0. VCPHEVC decoder registration also returns 0 but
+  does NOT fix the bitmap. This reproduces corruption before Photos/GPU
+  display; do not call it a screen-compositor-only bug.
+- Weather again failed to launch (mobile workspace false, SpringBoard 3).
+  The 140-second composed logger captures Widget and fairplay, but no live
+  Weather app/forecast request. This is a diagnostic-launch failure, not
+  evidence that the forecast succeeded or that cloud No-account is its
+  sole blocker. Actual Weather.app Info confirms com.apple.weather.
+- Read only small ranges from the installed arm64 shared cache using HFS
+  mapping metadata, Mach-O export trie and Apple dyld_cache_format.h. Local
+  LLVM disassembly of IOSurface exports/client implementations verifies:
+  IncrementUseCount notifies trap 0 only at local 0->1, decrement trap 1 at
+  1->0, two categories 0/1. IsInUse reads a shared u64 at state offset 0x18.
+  The current kernel accepts BOTH traps as no-ops, so the shared in-use
+  indication never updates. This is a concrete missing protocol, a plausible
+  premature-pool-reuse cause; it is not yet proven the HEIC corruption cause.
+- 0353 implements per-client active-category bits and atomic shared counts
+  at 0x18/0x1c. Duplicate transitions are idempotent; invalid categories and
+  unknown IDs fail. Releasing/closing a client removes its outstanding
+  contributions before dropping the surface, avoiding leaked use counts.
+  Existing lock order (client then global surface lock) is preserved.
+- Initially opt-in herosuse=1; default preserves existing behavior. Single
+  kernel C++ object compilation and application to the 0352 baseline pass.
+  Full CI and real API/pool/decode regressions remain pending.
+- Private code ranges, disassembly, runtime addresses and all image files
+  stay in rear-focus-0352/surface-cache/ and diagnostics, outside Git. REA
+  native provider was unavailable earlier; evidence here is local LLVM
+  disassembly, not a claimed REA/Ghidra decompilation.
+- User clarifies graphics stutter also affects home paging/app scrolling.
+  Camera 8-10 fps alone does not explain that. Add runtime CPU/frame timing
+  observation without claiming an established UI performance improvement.
+  Normal untimed handback is still outstanding.
+
 ## 2026-11-17: focused decode/Weather trial rebooted
 
 - Installed and readback-verified the SAME 0352 kernel/ADT with 360-second
