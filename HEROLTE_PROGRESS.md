@@ -1,5 +1,23 @@
 # HEROLTE (Galaxy S7 SM-G930F, Exynos 8890): progreso
 
+## 2026-11-17: combined 0352 trial installed and reboot requested
+
+- Full BOOT/drop predecessor checks and backups completed against photo2.
+  Timed 0352 BOOT d1b2cef9efa2d7bd87301397377e39a66f18a337b9de9e9a3306f2140461da0b
+  and drop 6964f904c78861396bed3c0e2216dcc655be97ed191ac86013bfbce77cbc9fd3
+  have matching device readback. Actual reboot request:
+  2026-11-16 15:21:20 UTC (Nov 17 00:21:20 KST).
+- Kernel source is 29f209f / CI 43891195416; runtime source 9343fc1 includes
+  the guarded software HEVC registration, mobile-user Live Photo-off trial,
+  longer watchdog/logging and SpringBoard launch fallback. Device behavior
+  is pending; do not equate the successful install with iOS/AF/photo success.
+- Recovery timer is now 300 seconds (+ flush/reset/recovery startup). Pull
+  waits up to 480 seconds and saves diagnostics/rear-focus-0352/, including
+  the actual mobile Camera plist and its pre-trial backup for verification.
+- User was asked after the real reboot whether ordinary photos persist and
+  whether rear focus improves. Those answers are pending. Normal untimed
+  candidate and checked handback scripts exist privately but are not run.
+
 ## 2026-11-17: 0352 CI passed; HEIC software encoder trial
 
 - CI 43891195416 at 29f209f passed, including the Cortex-A53 no-LSE check.
