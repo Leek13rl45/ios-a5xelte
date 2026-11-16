@@ -74,6 +74,7 @@ open_weather(void)
 	/* Retry after network/clock bootstrap, clearing the daemon's early-boot
 	 * request state. The user's saved cities and settings stay intact. */
 	restart_process("weatherd");
+	restart_process("Weather");
 	open_application(@"com.apple.weather");
 }
 
@@ -94,9 +95,9 @@ network_state(void)
 }
 
 static void
-bootstrap_clock(void)
+bootstrap_clock(BOOL retry_network)
 {
-	if (time(NULL) >= 1577836800)
+	if (!retry_network && time(NULL) >= 1577836800)
 		return;
 	/* Prefer a real network clock. Validate server mode, synchronization,
 	 * stratum and echoed origin token before accepting a reply. */
@@ -134,6 +135,10 @@ bootstrap_clock(void)
 		}
 		freeaddrinfo(list);
 	}
+	/* A late network retry must not replace an already valid running clock
+	 * with an older installation seed if SNTP is unavailable. */
+	if (retry_network && time(NULL) >= 1577836800)
+		return;
 	/* A fresh host-generated UTC seed is a diagnostic fallback when network
 	 * time is not yet reachable. It is refreshed for each installation. */
 	FILE *f = fopen("/private/var/herolte/clock.seed", "r");
@@ -451,14 +456,32 @@ main(void)
 		/* Network is brought up independently during boot. Let it settle. */
 		sleep(15);
 		network_state();
-		bootstrap_clock();
+		bootstrap_clock(NO);
 		check_url(@"https://www.apple.com/library/test/success.html");
 		check_url(@"https://weather-data.apple.com/");
 		/* An HTTP rejection from this unauthenticated endpoint still proves
 		 * DNS/TLS transport. It does not prove Weather's authenticated API works. */
 		front_sample();
+		if (!getenv("HERO_PROBE_FRONT") && getenv("HERO_PROBE_NETWORK_WAIT")) {
+			int seconds = atoi(getenv("HERO_PROBE_NETWORK_WAIT"));
+			if (seconds > 90)
+				seconds = 90;
+			for (int waited = 0; waited < seconds; waited += 3) {
+				struct ifaddrs *interfaces = NULL;
+				BOOL ready = NO;
+				if (!getifaddrs(&interfaces)) {
+					for (struct ifaddrs *i = interfaces; i; i = i->ifa_next)
+						if (i->ifa_addr && !strcmp(i->ifa_name, "en0") && i->ifa_addr->sa_family == AF_INET)
+							ready = YES;
+					freeifaddrs(interfaces);
+				}
+				if (ready)
+					break;
+				sleep(3);
+			}
+		}
 		network_state();
-		bootstrap_clock();
+		bootstrap_clock(YES);
 		printf("hero-system-probe: late UTC %s\n", [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]].UTF8String);
 		check_url(@"https://www.apple.com/library/test/success.html");
 		check_url(@"https://weather-data.apple.com/");

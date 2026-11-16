@@ -1,5 +1,45 @@
 # HEROLTE (Galaxy S7 SM-G930F, Exynos 8890): progreso
 
+## 2026-11-16: 0350 controls verified; native front resolution trial (0351)
+
+- CI 43878704098 at ec1e4fe passed. Installed/readback verified timed 0350
+  BOOT 439f3805349bd5c836c6e874d6412e82faefbdb4426423a6f334aff3126bcee7,
+  drop c5b90b9e03108aa4a635bfbb822357239dfa91a3c00e238133f2aee88555d1fd;
+  reboot 23:04:59 KST. Evidence: diagnostics/front-pair-0350/.
+- Paired controls readback is correct (1020/1020 lines, gain 32/32).
+  Controlled 512-line RAW capture: gain 32 cell sites TL/TR/BL/BR above black
+  = 26.03/13.78/12.98/25.99; gain 64 = 51.74/27.28/25.62/51.58;
+  repeat gain 32 = 26.12/13.82/13.00/26.05. All sites scale together by
+  ~1.98x. Front app WB stays near 2.02/1.88 around 2x analog gain instead
+  of the old 4.14/3.89. User still reports abnormal front / lack of focus;
+  this is not a verified complete front-image fix. Distance clarification
+  (close versus arm's length) was asked and has not been answered yet.
+- Exclusive sampling now succeeds: real rear 2016x1512, twelve complete
+  reads through sequence 13, saved rear-sample.rwframe (3,810,360 bytes).
+  Temporarily stopping media prevents its prewarm reader from switching the
+  global source during the probe. Front/gain samples are recovered too.
+- Front full demosaic at 1504x1128 costs about 103 ms/render and steady
+  preview is ~7.5 fps; it is too expensive as the default. The input is
+  only 1304x980. The user did not report resolved sharpness. S5K4E6 has no
+  actuator, so physical autofocus cannot be added by this driver.
+- Late network clock refresh succeeds via SNTP; UTC is now an actual
+  network time, with Asia/Seoul retained. For normal use, the probe can wait
+  for Wi-Fi then retry network time without camera tests; a failed late
+  retry never replaces a valid running clock with a stale host seed.
+- 0351 uses the phone's existing native 2608x1960 4E6 mode table, removing
+  the stream's generic SMIA binning overrides. Four 10 MiB front slots need
+  40 MiB at 0xd0800000..0xd3000000; rear moves to 0xd4000000 (36 MiB map).
+  Verified both ranges fit this phone's reserved camera ION
+  0xd0800000..0xdec00000 and overlap no actual ADT RAM bank. No ADT change.
+  Front reads take a stable cached snapshot before packing/uiomove, dropping
+  a reused slot before exposing bytes. Both kernel objects compile and
+  patch application is checked. CI/device trial are pending. Next runtime
+  will use the fast cached-cell renderer with this larger native input and
+  file-backed front capture storage; no physical-focus guarantee is made.
+- Phone is back in TWRP on timed 0350; normal 0350 BOOT candidate is prepared
+  (6f0a284bb44305bda560313abef60e469caedc6bda9fef0a96e071342fe7a10c),
+  not installed. Native-resolution trial files: front-native-0351/.
+
 ## 2026-11-16: 0349 rear works; 0350 front paired controls
 
 - Corrected CI 43872733594 passed. Installed/readback verified timed 0349
