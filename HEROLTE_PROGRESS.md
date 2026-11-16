@@ -32,10 +32,20 @@
   `a77b136c8401e0f6d12eb76805eb9f2acf6f64ca4eb75b4e17e1a1fe9342914b`,
   with working Bluetooth ADT/boot arguments retained. Combined drop includes
   clock seed/retry probe, updated front library and `cam.media=1`; the front
-  is initialized only after the rear trial stops. Current USB disconnected
-  before installation. Await TWRP reconnection, verify existing BOOT/drop,
-  back up, install/read back both candidates and reboot. Private evidence:
-  `s7-port-work/diagnostics/weather-front-probe/`.
+  is initialized only after the rear trial stops. USB disconnected before
+  the first install attempt. Subsequent attempts stopped on device absence
+  or a short BOOT backup read, before any device write. Both LIBUSB and
+  NATIVE ADB transports observed disconnects; no causal fix is established.
+- At 20:55 KST a stable NATIVE ADB connection allowed BOOT/drop identity
+  checks, backups, upload checksums, both writes and readback verification.
+  Refreshed the host UTC seed immediately before reboot and verified the
+  updated package again. **Reboot at 20:55:40 KST**, installed 0348 BOOT
+  `a77b136c…9342914b` and the updated front library / network-clock probe.
+  Next: user retries manual-city Weather and front preview after two minutes,
+  then returns to TWRP after three minutes for console, test output and RAW.
+  These changes are installed but functional success is still unverified.
+  Private evidence: `s7-port-work/diagnostics/weather-front-probe/`; install
+  receipt/backups: `s7-port-work/rearcam-43855092408/`.
 
 ## 2026-11-16: 0347 receives data; full frame and color still unresolved
 
