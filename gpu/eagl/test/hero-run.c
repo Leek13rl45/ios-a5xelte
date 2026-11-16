@@ -1087,6 +1087,92 @@ devices_start(__unused void *unused)
    return NULL;
 }
 
+/*
+ * The rear camera's staged bring-up (0346, kern.herolte_rcam), on its own and apart from cam.level. From the drop zone:
+ *   rcam.level     N (0-5): kern.herolte_rcam=N, 45 s after the start (after devices_start's front camera and Bluetooth,
+ *                  which share the S2MPB02's bus). None: nothing.
+ *   rcam-comp.bin  the phone's own companion firmware (S5C73C3, companion_fw_imx260.bin), written to
+ *                  kern.herolte_rcam_fw first when present (the kernel checks its CRC32 trailer); stage 3 needs it.
+ *   rcam.keep      (any content) kern.herolte_rcam_keep=1 before the run: stage 5 leaves the sensor streaming.
+ *   rcam.dump      (any content) after the run, the captured frame (kern.herolte_rcam_pic, 1 MiB at a time) into
+ *                  DROP_DIR rcam-frame.raw and its kern.herolte_rcam_pic_info into rcam-frame.txt.
+ */
+static void
+rcam_dump(void)
+{
+   char info[512] = "";
+   size_t len = sizeof(info) - 1;
+   if (sysctlbyname("kern.herolte_rcam_pic_info", info, &len, NULL, 0) != 0) {
+      herodrm_log("hero-run: rear camera: no frame to dump: %s", strerror(errno));
+      return;
+   }
+   info[len < sizeof(info) ? len : sizeof(info) - 1] = 0;
+   const char *b = strstr(info, "\nbytes ");
+   long want = b ? atol(b + 7) : 0;
+   unsigned char *frame = want > 0 ? malloc((size_t)want) : NULL;
+   long got = 0;
+   while (frame && got < want) {
+      unsigned off = (unsigned)got;
+      size_t n = (size_t)(want - got);
+      if (sysctlbyname("kern.herolte_rcam_pic_off", NULL, NULL, &off, sizeof(off)) != 0 ||
+          sysctlbyname("kern.herolte_rcam_pic", frame + got, &n, NULL, 0) != 0 || n == 0)
+         break;
+      got += (long)n;
+   }
+   int ok = 0;
+   int fd = open(DROP_DIR "rcam-frame.raw", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+   if (fd >= 0) {
+      ok = got > 0 && write(fd, frame, (size_t)got) == got;
+      fsync(fd);
+      close(fd);
+   }
+   FILE *t = fopen(DROP_DIR "rcam-frame.txt", "w");
+   if (t) {
+      fprintf(t, "%sfile_bytes %ld\n", info, ok ? got : 0L);
+      fflush(t);
+      fsync(fileno(t));
+      fclose(t);
+   }
+   free(frame);
+   herodrm_log("hero-run: rear camera: frame dump %ld of %ld bytes: %s", got, want, ok && got == want ? "rcam-frame.raw" :
+       "INCOMPLETE");
+}
+
+static void *
+rcam_start(__unused void *unused)
+{
+   int level = drop_level("rcam.level");
+   if (level < 0)
+      return NULL;
+   sleep(45);
+   if (access(DROP_DIR "rcam.keep", F_OK) == 0) {
+      unsigned one = 1;
+      herodrm_log("hero-run: rear camera: keep streaming: %s",
+          sysctlbyname("kern.herolte_rcam_keep", NULL, NULL, &one, sizeof(one)) == 0 ? "set" : strerror(errno));
+   }
+   FILE *f = fopen(DROP_DIR "rcam-comp.bin", "rb");
+   if (f) {
+      unsigned char *fw = malloc(1024 * 1024);
+      size_t n = fw ? fread(fw, 1, 1024 * 1024, f) : 0;
+      fclose(f);
+      int ok = n && sysctlbyname("kern.herolte_rcam_fw", NULL, NULL, fw, n) == 0;
+      herodrm_log("hero-run: rear camera: companion firmware %zu bytes: %s%s", n, ok ? "loaded" : "NOT loaded: ",
+          ok ? "" : strerror(errno));
+      free(fw);
+   } else {
+      herodrm_log("hero-run: rear camera: no rcam-comp.bin in the drop");
+   }
+   int err = sysctlbyname("kern.herolte_rcam", NULL, NULL, &level, sizeof(level)) == 0 ? 0 : errno;
+   int done = -1;
+   size_t len = sizeof(done);
+   sysctlbyname("kern.herolte_rcam", &done, &len, NULL, 0);
+   herodrm_log("hero-run: rear camera: level %d: %s; stages done %d (the kernel log's \"rcam:\" lines say why)", level,
+       err ? strerror(err) : "ok", done);
+   if (access(DROP_DIR "rcam.dump", F_OK) == 0)
+      rcam_dump();
+   return NULL;
+}
+
 static id
 hr_send(id object, const char *selector)
 {
@@ -1252,6 +1338,9 @@ main(int main_argc, char **main_argv)
    pthread_t devices;
    if (pthread_create(&devices, NULL, devices_start, NULL) == 0)
       pthread_detach(devices);
+   pthread_t rcam;
+   if (pthread_create(&rcam, NULL, rcam_start, NULL) == 0)
+      pthread_detach(rcam);
    sleep(20);
    load_env();
    posix_spawn_file_actions_t fa;

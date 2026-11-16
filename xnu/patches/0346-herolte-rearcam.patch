@@ -1,0 +1,1678 @@
+From: herolte rear camera
+Subject: [PATCH] herolte: rear camera (IMX260 + S5C73C3 companion) staged bring-up, kern.herolte_rcam
+
+(0346, on top of 0345.) The rear camera driven by the AP kernel alone, no FIMC-IS firmware, as the front of 0342
+(kern.notefe_cam) but in its own file, bsd/dev/herolte_rcam.c. `sysctl kern.herolte_rcam=N` (root) runs stages 1..N,
+each idempotent; 0 puts everything down. Klog `rcam:`.
+  0  stream off, receiver, Samsung's power-off order, pins, clocks, BUCK1/BB as found
+  1  S2MPB02 rails (codes checked against the DTB; BUCK1/BB on with 0342's front writes if off), MCLK0/1 26 MHz,
+     companion reset gpc1-2, sensor reset gpc1-0 (fimc-is-module-imx260.c order and delays), PMIC readbacks
+  2  I2C0 (gpc2-0/1, bit-banged): companion 0x0000 (0x73c3) / 0x0002, IMX260 0x0016 / 0x0017
+  3  companion firmware (kern.herolte_rcam_fw, CRC32 trailer checked) over bit-banged SPI1 (standard pin order checked
+     against the I2C ID; swapped MISO/MOSI only with kern.herolte_rcam_spiswap=1), CRC engine, ARM go, setfiles
+  4  IMX260 global + 5 extra writes + mode 7 (2016x1512@30 RAW10 4 lanes, public setA tables; mode 3 from the
+     phone's firmware with kern.herolte_rcam_mode=3), companion bypass 0x003a = 0x0099 read back
+  5  CSIS0 + CAM0 D-PHY + SysMMU 0x140e0000 bypass, settle 30, stream, first frame at 0xd1400000, status and stats,
+     stream off unless kern.herolte_rcam_keep=1; the frame out through kern.herolte_rcam_pic_info / _pic / _pic_off
+---
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -116,6 +116,7 @@ bsd/dev/sweet_sta.c			standard
+ bsd/dev/sweet_net.c			standard
+ bsd/dev/sweet_apple80211.c		standard
+ bsd/dev/herolte_gl.c			standard
++bsd/dev/herolte_rcam.c			standard
+ bsd/dev/a5xelte_keys.c			standard
+ bsd/dev/a5xelte_touch.c			standard
+ bsd/dev/sweet_sample.c			standard
+diff --git a/bsd/dev/herolte_rcam.c b/bsd/dev/herolte_rcam.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/herolte_rcam.c
+@@ -0,0 +1,1645 @@
++/*
++ * HEROLTE (0346): the REAR camera, staged bring-up: `sysctl kern.herolte_rcam=N` (root). Klog `rcam:`.
++ *
++ * Sony IMX260 behind a Samsung S5C73C3 ("C3") companion, driven by the AP kernel alone: no FIMC-IS ISP firmware, the
++ * same approach as the front camera (0342, kern.notefe_cam). Everything here is separate from the front's code; the two
++ * share only the S2MPB02 PMIC (HSI2C9, 0x59) and the pin bank gpc2 (front: I2C1 on gpc2-2/3, rear: I2C0 on gpc2-0/1).
++ *
++ * Stages; writing N runs 1..N in order (each idempotent), 0 puts everything down:
++ *   0  stream off, the receiver as found, the power-off sequence (reverse), every pin and clock as found
++ *   1  rails + MCLK + resets (fimc-is-module-imx260.c SENSOR_SCENARIO_NORMAL / GPIO_SCENARIO_ON), each PMIC readback
++ *   2  I2C0 probe (bit-banged gpc2-0 SDA / gpc2-1 SCL, as Samsung's own i2c-gpio "i2c@3d"): companion 0x0000/0x0002,
++ *      IMX260 0x0016/0x0017
++ *   3  companion firmware (from kern.herolte_rcam_fw, CRC32 trailer checked) over SPI1 (bit-banged gpc3-4..7), the
++ *      companion's own CRC engine, ARM go, version readback, master and mode setfiles (fimc-is-companion_c3.c)
++ *   4  IMX260 global table + the ISP firmware's five extra writes + the mode table; companion bypass 0x003a; no stream
++ *   5  CSIS0 + D-PHY + SysMMU, stream on, one frame into the ring at RC_BUF, status and stats; stream off unless
++ *      kern.herolte_rcam_keep=1
++ * Options (root): kern.herolte_rcam_keep, _mode (7 default; 3 = 4032x2268@60, firmware table), _settle (0 = Samsung's
++ * per-mode value), _deskew (0 per mode, 1 off, 2 on), _bypass (the value for companion 0x003a, 0x0099), _spiswap (1 also
++ * tries SPI1's MISO/MOSI swapped). The captured frame: kern.herolte_rcam_pic_info (text) and kern.herolte_rcam_pic
++ * (slot 0 in chunks of up to 1 MiB from kern.herolte_rcam_pic_off).
++ */
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <sys/kauth.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <mach/mach_time.h>
++#include <pexpert/pexpert.h>
++#include <sys/proc.h>
++#include <string.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t notefe_physmap(uint64_t pa, uint64_t len);     /* SweetFramebuffer.cpp (0342), write-combined */
++
++/* ---- addresses (this phone's DTB, hw9.dts; Samsung's S5E8890 pwrcal cmusfr.h for the CMU registers) ---- */
++#define RC_PMU          0x105c0000u     /* cam0 domain 0x4020 (+4 status), cam1 0x40a0; CAM0 PHY isolation 0x70c */
++#define RC_TOP          0x10570000u     /* SCLK_ISP_SENSOR0 0xb00.. (mux, div, stat, enable), SENSOR1 0xb10..; CSIS0 0x2b8/0x878 */
++#define RC_PINS         0x136d0000u     /* pinctrl@136D0000: gpd1 0x40, gpc1 0x120, gpc2 0x140, gpc3 0x160, gpk0 0x180 */
++#define RC_HSI2C9       0x13680000u     /* the S2MPB02's bus */
++#define RC_CSIS0        0x14000000u     /* fimc_is_sensor@14000000, csis v4.0 */
++#define RC_CAM0         0x144d0000u     /* CMU_CAM0 */
++#define RC_CAM0L        0x140f0000u     /* CMU_CAM0_LOCAL */
++#define RC_PHY0         0x144f1000u     /* phy_cam0_csi@144F1040: reset bit 1 for phy 0 (CSIS0) */
++#define RC_MMU          0x140e0000u     /* the SysMMU whose master list has fimc_is_sensor@14000000 */
++#define RC_BUF          0xd1400000u     /* camera ION carve-out 0xd0800000 + 0xe400000; the front uses its first 10 MB */
++#define RC_SLOT         0x1200000u      /* 18 MB: a mode-3 frame (4032 x 2268 x 2) fits; mode 7 is 6096384 bytes */
++#define RC_MAP_LEN      (2 * RC_SLOT)   /* slot 0: the first frame (DMA0 ADDR1), slot 1: the later ones (ADDR2-8) */
++
++#define B_GPD1  0x40u
++#define B_GPC1  0x120u
++#define B_GPC2  0x140u
++#define B_GPC3  0x160u
++#define B_GPK0  0x180u
++
++#define RC_IMX260       0x1a            /* 8-bit 0x34 */
++#define RC_COMP         0x3d            /* 8-bit 0x7a, "fimc-is-vision@3d" */
++#define RC_PMIC         0x59
++
++static LCK_GRP_DECLARE(rc_grp, "herolte_rcam");
++static LCK_MTX_DECLARE(rc_mtx, &rc_grp);
++
++static vm_offset_t rc_pmu, rc_top, rc_pins, rc_i2c9, rc_csis, rc_cam0, rc_cam0l, rc_phy, rc_mmu, rc_ring;
++static int rc_last;                     /* the last stage that completed */
++static bool rc_powered, rc_booted, rc_configured, rc_streaming;
++static uint32_t rc_o_keep, rc_o_mode = 7, rc_o_settle, rc_o_deskew, rc_o_bypass = 0x0099, rc_o_spiswap;
++static uint8_t *rc_fw;
++static uint32_t rc_fw_len;
++static int rc_sleep_ev;
++
++SYSCTL_UINT(_kern, OID_AUTO, herolte_rcam_keep, CTLFLAG_RW | CTLFLAG_LOCKED, &rc_o_keep, 0, "rear camera: 1 keeps streaming after stage 5");
++SYSCTL_UINT(_kern, OID_AUTO, herolte_rcam_mode, CTLFLAG_RW | CTLFLAG_LOCKED, &rc_o_mode, 0, "rear camera: IMX260 mode, 7 (2016x1512@30) or 3 (4032x2268@60)");
++SYSCTL_UINT(_kern, OID_AUTO, herolte_rcam_settle, CTLFLAG_RW | CTLFLAG_LOCKED, &rc_o_settle, 0, "rear camera: CSIS0 HS settle (0 = Samsung's per-mode value)");
++SYSCTL_UINT(_kern, OID_AUTO, herolte_rcam_deskew, CTLFLAG_RW | CTLFLAG_LOCKED, &rc_o_deskew, 0, "rear camera: CSIS0 deskew (0 per mode, 1 off, 2 on)");
++SYSCTL_UINT(_kern, OID_AUTO, herolte_rcam_bypass, CTLFLAG_RW | CTLFLAG_LOCKED, &rc_o_bypass, 0, "rear camera: value for companion 0x003a (0x0099 bypass on)");
++SYSCTL_UINT(_kern, OID_AUTO, herolte_rcam_spiswap, CTLFLAG_RW | CTLFLAG_LOCKED, &rc_o_spiswap, 0, "rear camera: 1 also tries SPI1 with MISO/MOSI swapped (drives gpc3-6)");
++
++static inline uint32_t
++rc_rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static inline void
++rc_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++}
++
++static void
++rc_sleep_ms(uint32_t ms)
++{
++	assert_wait_timeout((event_t)&rc_sleep_ev, THREAD_UNINT, ms, NSEC_PER_MSEC);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++rc_maps(void)
++{
++	if (!rc_pmu) {
++		rc_pmu = ml_io_map(RC_PMU, 0x5000);
++		rc_top = ml_io_map(RC_TOP, 0x1000);
++		rc_pins = ml_io_map(RC_PINS, 0x1000);
++		rc_i2c9 = ml_io_map(RC_HSI2C9, 0x1000);
++	}
++	return rc_pmu && rc_top && rc_pins && rc_i2c9;
++}
++
++/* ---- pins: pinctrl@136D0000 banks, 4-bit function, 1-bit data, 2-bit pull (as 0342's nc_pin) ---- */
++static void
++rc_pin(uint32_t bank, unsigned pin, int func, int pud, int level)
++{
++	if (level >= 0) {
++		uint32_t dat = rc_rd(rc_pins, bank + 4);
++		rc_wr(rc_pins, bank + 4, level ? (dat | (1u << pin)) : (dat & ~(1u << pin)));
++	}
++	if (pud >= 0) {
++		uint32_t v = rc_rd(rc_pins, bank + 8);
++		rc_wr(rc_pins, bank + 8, (v & ~(3u << (2 * pin))) | ((uint32_t)pud << (2 * pin)));
++	}
++	if (func >= 0) {
++		uint32_t v = rc_rd(rc_pins, bank);
++		rc_wr(rc_pins, bank, (v & ~(0xfu << (4 * pin))) | ((uint32_t)func << (4 * pin)));
++	}
++}
++
++/* every pin this file drives, saved before the first change and put back field by field at stage 0 */
++static const struct { uint32_t bank; uint8_t pin; const char *name; } rc_pinlist[] = {
++	{ B_GPC1, 0, "gpc1-0 sensor reset" }, { B_GPC1, 2, "gpc1-2 companion reset" },
++	{ B_GPK0, 0, "gpk0-0 MCLK0 (sensor)" }, { B_GPK0, 1, "gpk0-1 MCLK1 (companion)" },
++	{ B_GPC2, 0, "gpc2-0 I2C0 SDA" }, { B_GPC2, 1, "gpc2-1 I2C0 SCL" },
++	{ B_GPC3, 4, "gpc3-4 SPI1" }, { B_GPC3, 5, "gpc3-5 SPI1 SSN" }, { B_GPC3, 6, "gpc3-6 SPI1" }, { B_GPC3, 7, "gpc3-7 SPI1" },
++};
++#define RC_NPINS (sizeof(rc_pinlist) / sizeof(rc_pinlist[0]))
++static struct { uint8_t func, dat, pud; bool saved; } rc_pinsave[RC_NPINS];
++
++static void
++rc_pins_save(void)
++{
++	for (unsigned i = 0; i < RC_NPINS; i++) {
++		uint32_t b = rc_pinlist[i].bank, p = rc_pinlist[i].pin;
++		rc_pinsave[i].func = (uint8_t)((rc_rd(rc_pins, b) >> (4 * p)) & 0xf);
++		rc_pinsave[i].dat = (uint8_t)((rc_rd(rc_pins, b + 4) >> p) & 1);
++		rc_pinsave[i].pud = (uint8_t)((rc_rd(rc_pins, b + 8) >> (2 * p)) & 3);
++		rc_pinsave[i].saved = true;
++		printf("rcam: pin %s as found: function %u data %u pull %u\n", rc_pinlist[i].name, rc_pinsave[i].func,
++		    rc_pinsave[i].dat, rc_pinsave[i].pud);
++	}
++}
++
++static void
++rc_pins_restore(void)
++{
++	for (unsigned i = 0; i < RC_NPINS; i++) {
++		if (rc_pinsave[i].saved) {
++			rc_pin(rc_pinlist[i].bank, rc_pinlist[i].pin, rc_pinsave[i].func, rc_pinsave[i].pud, rc_pinsave[i].dat);
++			rc_pinsave[i].saved = false;
++		}
++	}
++	printf("rcam: pins as found: gpc1 con %#x dat %#x, gpc2 con %#x pud %#x, gpc3 con %#x, gpk0 con %#x\n",
++	    rc_rd(rc_pins, B_GPC1), rc_rd(rc_pins, B_GPC1 + 4), rc_rd(rc_pins, B_GPC2), rc_rd(rc_pins, B_GPC2 + 8),
++	    rc_rd(rc_pins, B_GPC3), rc_rd(rc_pins, B_GPK0));
++}
++
++/* ---- the S2MPB02 on HSI2C9 by polling (0342's nc_message, its own copy here) ---- */
++static void
++rc_bus_init(void)
++{
++	rc_wr(rc_i2c9, 0x00, 0x80000009u);
++	rc_wr(rc_i2c9, 0x00, 0x00000009u);
++	rc_wr(rc_i2c9, 0x48, 0);
++	rc_wr(rc_i2c9, 0x60, 0x78787800u);
++	rc_wr(rc_i2c9, 0x64, 0x3c007878u);
++	rc_wr(rc_i2c9, 0x68, 0x000100f0u);
++	rc_wr(rc_i2c9, 0x6c, 0x3cu);
++	rc_wr(rc_i2c9, 0x08, 0xfu);
++	rc_wr(rc_i2c9, 0x40, 0x80000000u);
++	rc_wr(rc_i2c9, 0x20, 0);
++}
++
++static bool
++rc_message(uint8_t slave, bool receive, uint8_t *bytes, unsigned count, bool stop)
++{
++	uint32_t last = 0;
++	bool xfer_done = false;
++	unsigned done = 0;
++	rc_wr(rc_i2c9, 0x24, rc_rd(rc_i2c9, 0x24));
++	rc_wr(rc_i2c9, 0x04, 3u | (receive ? (1u << 4) : (1u << 16)));
++	rc_wr(rc_i2c9, 0x70, (uint32_t)slave << 10);
++	rc_wr(rc_i2c9, 0x00, 9u | (receive ? 0x40u : 0x80u));
++	rc_wr(rc_i2c9, 0x20, 0xf80u | (receive ? 0x42u : 1u));
++	rc_wr(rc_i2c9, 0x44, count | (receive ? 0x10000u : 0) | (stop ? 0x20000u : 0) | 0x80000000u);
++	for (unsigned us = 0; us < 20000; us++) {
++		uint32_t irq = rc_rd(rc_i2c9, 0x24);
++		if (irq) {
++			last |= irq;
++			rc_wr(rc_i2c9, 0x24, irq);
++		}
++		if (irq & 0xf00u) {
++			break;
++		}
++		if (irq & 0x80u) {
++			xfer_done = true;
++		}
++		if (receive) {
++			while (done < count && ((rc_rd(rc_i2c9, 0x30) >> 16) & 0x7fu)) {
++				bytes[done++] = (uint8_t)rc_rd(rc_i2c9, 0x38);
++			}
++		} else {
++			while (done < count && !(rc_rd(rc_i2c9, 0x30) & (1u << 7))) {
++				rc_wr(rc_i2c9, 0x34, bytes[done++]);
++			}
++		}
++		if (done == count && (xfer_done || (receive && stop))) {
++			rc_wr(rc_i2c9, 0x20, 0);
++			if (!stop) {
++				return true;
++			}
++			for (unsigned n = 0; n < 10000; n++) {
++				if (!(rc_rd(rc_i2c9, 0x50) & (1u << 17))) {
++					return true;
++				}
++				delay(1);
++			}
++			break;
++		}
++		delay(1);
++	}
++	printf("rcam: hsi2c9 %#x %s %u/%u failed int %#x trans %#x fifo %#x\n", slave, receive ? "rx" : "tx", done, count,
++	    last, rc_rd(rc_i2c9, 0x50), rc_rd(rc_i2c9, 0x30));
++	rc_wr(rc_i2c9, 0x20, 0);
++	rc_bus_init();
++	return false;
++}
++
++static bool
++rc_pmic_read(uint8_t reg, uint8_t *v, unsigned n)
++{
++	for (unsigned attempt = 0; attempt < 3; attempt++) {
++		if (rc_message(RC_PMIC, false, &reg, 1, false) && rc_message(RC_PMIC, true, v, n, true)) {
++			return true;
++		}
++		delay(500);
++	}
++	return false;
++}
++
++static bool
++rc_pmic_write(uint8_t reg, uint8_t v)
++{
++	uint8_t b[2] = { reg, v };
++	for (unsigned attempt = 0; attempt < 3; attempt++) {
++		if (rc_message(RC_PMIC, false, b, 2, true)) {
++			return true;
++		}
++		delay(500);
++	}
++	return false;
++}
++
++/*
++ * The rails (S2MPB02, Samsung's s2mpb02-regulator.c / s2mpb02-private.h): LnCTRL = 0x1d + n, bit 7 enable, bits 6:0
++ * the voltage, 600 mV + 12.5 mV n (LDO1-5) or + 25 mV n (LDO6-18); BUCK2: B2CTRL1 0x0d bits 7:6 enable, B2CTRL2 0x0e
++ * 400 mV + 6.25 mV n. Ranges are this phone's DTB regulator-min/max-microvolt; a code outside them is refused.
++ * Only the listed rails' own registers are written, and BUCK1/BB exactly as the front does (rc_supply_on).
++ */
++enum { R_L1, R_L2, R_L3, R_L4, R_L7, R_L8, R_L9, R_L10, R_L11, R_L12, R_L14, R_L15, R_L17, R_B2, R_N };
++static const struct {
++	const char *name;
++	uint8_t ldo;            /* 0: BUCK2 */
++	uint32_t min_uv, max_uv;
++} rc_rails[R_N] = {
++	[R_L1] = { "VDDD_NORET_0.9V_COMP (LDO1)", 1, 950000, 950000 },
++	[R_L2] = { "VDDD_CORE_1.0V_COMP (LDO2)", 2, 1000000, 1000000 },
++	[R_L3] = { "VDDD_1.2V_CAM (LDO3)", 3, 1000000, 1200000 },
++	[R_L4] = { "VDDD_RET_1.0V_COMP (LDO4)", 4, 700000, 1050000 },
++	[R_L7] = { "VDDIO_1.8V_CAM (LDO7)", 7, 1800000, 1800000 },
++	[R_L8] = { "VDDIO_1.8V_COMP (LDO8)", 8, 1800000, 1800000 },
++	[R_L9] = { "VDDA_1.8V_COMP (LDO9)", 9, 1800000, 1800000 },
++	[R_L10] = { "VDDA_1.8V_CAM (LDO10)", 10, 1875000, 1875000 },
++	[R_L11] = { "VDDA_2.9V_CAM (LDO11)", 11, 1000000, 2950000 },
++	[R_L12] = { "VDDAF_2.8V_CAM (LDO12)", 12, 2800000, 2800000 },
++	[R_L14] = { "OIS_VM_2.8V (LDO14)", 14, 2800000, 2800000 },
++	[R_L15] = { "OIS_VDD_2.8V (LDO15)", 15, 2800000, 2800000 },
++	[R_L17] = { "OIS_VDD_1.8V (LDO17)", 17, 1800000, 1800000 },
++	[R_B2] = { "VDDD_CORE_0.8V_COMP (BUCK2)", 0, 650000, 850000 },
++};
++static struct { uint8_t ctrl, volt; bool saved; } rc_railsave[R_N];
++
++static uint8_t
++rc_rail_reg(int r)
++{
++	return rc_rails[r].ldo ? (uint8_t)(0x1d + rc_rails[r].ldo) : 0x0d;
++}
++
++static uint32_t
++rc_rail_uv(int r, uint8_t code)
++{
++	if (!rc_rails[r].ldo) {
++		return 400000u + code * 6250u;
++	}
++	return 600000u + (code & 0x7fu) * (rc_rails[r].ldo <= 5 ? 12500u : 25000u);
++}
++
++static void
++rc_rail_report(int r, const char *what)
++{
++	uint8_t v[2] = { 0, 0 };
++	if (!rc_pmic_read(rc_rail_reg(r), v, rc_rails[r].ldo ? 1 : 2)) {
++		printf("rcam: %s %s: PMIC readback FAILED\n", rc_rails[r].name, what);
++		return;
++	}
++	if (rc_rails[r].ldo) {
++		printf("rcam: %s %s: ctrl %#04x = %s, %u uV\n", rc_rails[r].name, what, v[0], v[0] & 0x80 ? "ON" : "off",
++		    rc_rail_uv(r, v[0]));
++	} else {
++		printf("rcam: %s %s: ctrl1 %#04x = %s, ctrl2 %#04x = %u uV\n", rc_rails[r].name, what, v[0],
++		    (v[0] & 0xc0) == 0xc0 ? "ON" : (v[0] & 0xc0) ? "partly on" : "off", v[1], rc_rail_uv(r, v[1]));
++	}
++}
++
++/* rail r on at uv (the voltage first for BUCK2, one write for an LDO), the as-found value kept for stage 0 */
++static bool
++rc_rail_on(int r, uint32_t uv)
++{
++	uint32_t base = rc_rails[r].ldo ? 600000u : 400000u;
++	uint32_t step = !rc_rails[r].ldo ? 6250u : rc_rails[r].ldo <= 5 ? 12500u : 25000u;
++	uint32_t maxcode = rc_rails[r].ldo ? 0x7fu : 0xffu;
++	if (uv < rc_rails[r].min_uv || uv > rc_rails[r].max_uv || uv < base || (uv - base) % step || (uv - base) / step > maxcode) {
++		printf("rcam: %s: %u uV is outside %u-%u uV (DTB) or off the %u uV grid: REFUSED\n", rc_rails[r].name, uv,
++		    rc_rails[r].min_uv, rc_rails[r].max_uv, step);
++		return false;
++	}
++	uint8_t code = (uint8_t)((uv - base) / step), reg = rc_rail_reg(r);
++	if (!rc_railsave[r].saved) {
++		uint8_t v[2] = { 0, 0 };
++		if (!rc_pmic_read(reg, v, rc_rails[r].ldo ? 1 : 2)) {
++			printf("rcam: %s: the PMIC does not answer\n", rc_rails[r].name);
++			return false;
++		}
++		rc_railsave[r].ctrl = v[0];
++		rc_railsave[r].volt = v[1];
++		rc_railsave[r].saved = true;
++		rc_rail_report(r, "as found");
++	}
++	bool ok;
++	if (rc_rails[r].ldo) {
++		ok = rc_pmic_write(reg, (uint8_t)(0x80u | code));
++		delay(180);                     /* S2MPB02_ENABLE_TIME_LDO, the regulator core's wait */
++	} else {
++		uint8_t c1 = 0;
++		ok = rc_pmic_read(reg, &c1, 1) && rc_pmic_write((uint8_t)(reg + 1), code) && rc_pmic_write(reg, (uint8_t)(c1 | 0xc0u));
++		delay(100);                     /* S2MPB02_ENABLE_TIME_BUCK */
++	}
++	char what[48];
++	snprintf(what, sizeof(what), "set %u uV (code %#04x)%s", uv, code, ok ? "" : " WRITE FAILED");
++	rc_rail_report(r, what);
++	return ok;
++}
++
++/* rail r back to what it was found as (off, unless something else had it on) */
++static void
++rc_rail_restore(int r)
++{
++	if (!rc_railsave[r].saved) {
++		return;
++	}
++	uint8_t reg = rc_rail_reg(r);
++	if (rc_rails[r].ldo) {
++		rc_pmic_write(reg, rc_railsave[r].ctrl);
++	} else if (rc_railsave[r].ctrl & 0xc0u) {
++		rc_pmic_write((uint8_t)(reg + 1), rc_railsave[r].volt);
++		rc_pmic_write(reg, rc_railsave[r].ctrl);
++	} else {
++		rc_pmic_write(reg, rc_railsave[r].ctrl);
++		rc_pmic_write((uint8_t)(reg + 1), rc_railsave[r].volt);
++	}
++	rc_railsave[r].saved = false;
++	rc_rail_report(r, (rc_railsave[r].ctrl & 0x80u) ? "as found (it was ON before rcam)" : "off (as found)");
++}
++
++/* ---- I2C0, bit-banged (Samsung's own "i2c@3d" is i2c-gpio on gpc2-0 SDA / gpc2-1 SCL, 2 us) ---- */
++#define RC_SDA  0u
++#define RC_SCL  1u
++#define RC_I2C_US 5
++
++static void
++rc_line(unsigned pin, int high)
++{
++	rc_pin(B_GPC2, pin, high ? 0 : 1, -1, high ? -1 : 0);     /* released (input, board pull-up) or driven low */
++	delay(RC_I2C_US);
++	if (high && pin == RC_SCL) {                               /* clock stretching */
++		for (unsigned n = 0; n < 1000 && !((rc_rd(rc_pins, B_GPC2 + 4) >> RC_SCL) & 1); n++) {
++			delay(1);
++		}
++	}
++}
++
++static int
++rc_sda(void)
++{
++	return (rc_rd(rc_pins, B_GPC2 + 4) >> RC_SDA) & 1;
++}
++
++static void
++rc_start(void)
++{
++	rc_line(RC_SDA, 1); rc_line(RC_SCL, 1); rc_line(RC_SDA, 0); rc_line(RC_SCL, 0);
++}
++
++static void
++rc_stop(void)
++{
++	rc_line(RC_SDA, 0); rc_line(RC_SCL, 1); rc_line(RC_SDA, 1);
++}
++
++static bool
++rc_byte_out(uint8_t b)
++{
++	for (int i = 7; i >= 0; i--) {
++		rc_line(RC_SDA, (b >> i) & 1);
++		rc_line(RC_SCL, 1);
++		rc_line(RC_SCL, 0);
++	}
++	rc_line(RC_SDA, 1);
++	rc_line(RC_SCL, 1);
++	bool ack = !rc_sda();
++	rc_line(RC_SCL, 0);
++	return ack;
++}
++
++static uint8_t
++rc_byte_in(bool ack)
++{
++	uint8_t b = 0;
++	rc_line(RC_SDA, 1);
++	for (int i = 7; i >= 0; i--) {
++		rc_line(RC_SCL, 1);
++		b = (uint8_t)(b << 1 | rc_sda());
++		rc_line(RC_SCL, 0);
++	}
++	rc_line(RC_SDA, ack ? 0 : 1);
++	rc_line(RC_SCL, 1);
++	rc_line(RC_SCL, 0);
++	rc_line(RC_SDA, 1);
++	return b;
++}
++
++/* 16-bit register address, n bytes back (repeated start, as i2c_transfer's two messages) */
++static bool
++rc_i2c_read(uint8_t a7, uint16_t reg, uint8_t *v, unsigned n)
++{
++	for (unsigned attempt = 0; attempt < 3; attempt++) {
++		rc_start();
++		bool ok = rc_byte_out((uint8_t)(a7 << 1)) && rc_byte_out((uint8_t)(reg >> 8)) && rc_byte_out((uint8_t)reg);
++		if (ok) {
++			rc_start();
++			ok = rc_byte_out((uint8_t)(a7 << 1 | 1));
++			for (unsigned i = 0; ok && i < n; i++) {
++				v[i] = rc_byte_in(i + 1 < n);
++			}
++		}
++		rc_stop();
++		if (ok) {
++			return true;
++		}
++		delay(200);
++	}
++	return false;
++}
++
++static bool
++rc_i2c_write(uint8_t a7, uint16_t reg, const uint8_t *v, unsigned n)
++{
++	for (unsigned attempt = 0; attempt < 3; attempt++) {
++		rc_start();
++		bool ok = rc_byte_out((uint8_t)(a7 << 1)) && rc_byte_out((uint8_t)(reg >> 8)) && rc_byte_out((uint8_t)reg);
++		for (unsigned i = 0; ok && i < n; i++) {
++			ok = rc_byte_out(v[i]);
++		}
++		rc_stop();
++		if (ok) {
++			return true;
++		}
++		delay(200);
++	}
++	return false;
++}
++
++static bool
++rc_sensor_wr8(uint16_t reg, uint8_t val)
++{
++	return rc_i2c_write(RC_IMX260, reg, &val, 1);
++}
++
++static int
++rc_sensor_rd8(uint16_t reg)
++{
++	uint8_t v = 0;
++	return rc_i2c_read(RC_IMX260, reg, &v, 1) ? v : -1;
++}
++
++static int
++rc_sensor_rd16(uint16_t reg)
++{
++	uint8_t v[2] = { 0, 0 };
++	return rc_i2c_read(RC_IMX260, reg, v, 2) ? (v[0] << 8 | v[1]) : -1;
++}
++
++/* the companion over I2C: 16-bit address, 16-bit data, big-endian (fimc_is_comp_i2c_read/write) */
++static int
++rc_comp_i2c_rd(uint16_t reg)
++{
++	uint8_t v[2] = { 0, 0 };
++	return rc_i2c_read(RC_COMP, reg, v, 2) ? (v[0] << 8 | v[1]) : -1;
++}
++
++static bool
++rc_comp_i2c_wr(uint16_t reg, uint16_t val)
++{
++	uint8_t v[2] = { (uint8_t)(val >> 8), (uint8_t)val };
++	return rc_i2c_write(RC_COMP, reg, v, 2);
++}
++
++/*
++ * ---- SPI1 to the companion, bit-banged on its pins (fimc_is_spi1 = spi@143A0000's gpc3-4/6/7, SSN gpc3-5) ----
++ * Mode 0, MSB first (the DTB sets no spi-cpol/cpha). Which of gpc3-6/7 is MOSI/MISO is Samsung's usual SPI pin order
++ * (CLK, nSS, MISO, MOSI), an assumption: stage 3 checks it (a read of the ID that I2C gave, or a write read back over
++ * I2C) and tries the other order only with kern.herolte_rcam_spiswap=1. The controller itself (its clocks in the cam1
++ * domain) is not used.
++ */
++static unsigned rc_clk = 4, rc_cs = 5, rc_miso = 6, rc_mosi = 7;
++static bool rc_spi_two_phase = true;    /* Samsung's read: [03 hi lo ff] with cs_change, then 2 bytes in a new frame */
++static bool rc_spi_swap;                /* the 16-bit read came back byte-swapped */
++static bool rc_spi_reads;               /* SPI reads give the I2C answer; else reads go over I2C */
++
++static void
++rc_spi_pins(void)
++{
++	rc_pin(B_GPC3, rc_cs, 1, 0, 1);             /* SSN high, output */
++	rc_pin(B_GPC3, rc_clk, 1, 1, 0);            /* CLK low, output */
++	rc_pin(B_GPC3, rc_mosi, 1, 1, 0);           /* MOSI low, output */
++	rc_pin(B_GPC3, rc_miso, 0, 1, -1);          /* MISO input, pull-down */
++}
++
++static inline void
++rc_dat(uint32_t *d, unsigned pin, int v)
++{
++	*d = v ? (*d | (1u << pin)) : (*d & ~(1u << pin));
++	rc_wr(rc_pins, B_GPC3 + 4, *d);
++	(void)rc_rd(rc_pins, B_GPC3 + 4);           /* the write reaches the pin before the next edge */
++}
++
++static void
++rc_spi_cs(bool active)
++{
++	uint32_t d = rc_rd(rc_pins, B_GPC3 + 4);
++	if (active) {
++		rc_dat(&d, rc_clk, 0);
++		rc_dat(&d, rc_cs, 0);
++	} else {
++		rc_dat(&d, rc_clk, 0);
++		rc_dat(&d, rc_cs, 1);
++	}
++	delay(1);
++}
++
++/* n bytes out (tx NULL: 0xff), n bytes in (rx NULL: dropped), inside one SSN frame */
++static void
++rc_spi_xfer(const uint8_t *tx, uint8_t *rx, size_t n)
++{
++	uint32_t d = rc_rd(rc_pins, B_GPC3 + 4);
++	for (size_t i = 0; i < n; i++) {
++		uint8_t o = tx ? tx[i] : 0xff, in = 0;
++		for (int b = 7; b >= 0; b--) {
++			rc_dat(&d, rc_mosi, (o >> b) & 1);
++			rc_dat(&d, rc_clk, 1);
++			in = (uint8_t)(in << 1 | ((rc_rd(rc_pins, B_GPC3 + 4) >> rc_miso) & 1));
++			rc_dat(&d, rc_clk, 0);
++		}
++		if (rx) {
++			rx[i] = in;
++		}
++	}
++}
++
++/* fimc_is_comp_spi_single_write: [0x02, addr hi, addr lo, data hi, data lo] */
++static void
++rc_spi_wr16(uint16_t addr, uint16_t val)
++{
++	uint8_t b[5] = { 0x02, (uint8_t)(addr >> 8), (uint8_t)addr, (uint8_t)(val >> 8), (uint8_t)val };
++	rc_spi_cs(true);
++	rc_spi_xfer(b, NULL, sizeof(b));
++	rc_spi_cs(false);
++}
++
++/* fimc_is_comp_spi_single_read: [0x03, addr hi, addr lo, dummy], then two bytes */
++static uint16_t
++rc_spi_rd16(uint16_t addr)
++{
++	uint8_t b[4] = { 0x03, (uint8_t)(addr >> 8), (uint8_t)addr, 0xff }, r[2] = { 0, 0 };
++	rc_spi_cs(true);
++	rc_spi_xfer(b, NULL, sizeof(b));
++	if (rc_spi_two_phase) {
++		rc_spi_cs(false);
++		rc_spi_cs(true);
++	}
++	rc_spi_xfer(NULL, r, 2);
++	rc_spi_cs(false);
++	return rc_spi_swap ? (uint16_t)(r[1] << 8 | r[0]) : (uint16_t)(r[0] << 8 | r[1]);
++}
++
++/* a companion register read: SPI when stage 3 proved it, else I2C */
++static int
++rc_comp_rd(uint16_t addr)
++{
++	return rc_spi_reads ? (int)rc_spi_rd16(addr) : rc_comp_i2c_rd(addr);
++}
++
++/*
++ * fimc_is_comp_spi_burst_write(buf, size, 256, LITTLE_ENDIAN): burst_width becomes ((256 + 1) / 2 * 2) - 3 = 253, so
++ * every SSN frame is [0x02, 0x6f, 0x12] + 253 bytes as they are in the file (256 on the wire), the last frame the
++ * remainder (sent even when empty, as Samsung does).
++ */
++static void
++rc_spi_burst(const uint8_t *buf, size_t size)
++{
++	static const uint8_t hdr[3] = { 0x02, 0x6f, 0x12 };
++	const size_t w = 253;
++	size_t i;
++	for (i = 0; i + w <= size; i += w) {
++		rc_spi_cs(true);
++		rc_spi_xfer(hdr, NULL, 3);
++		rc_spi_xfer(buf + i, NULL, w);
++		rc_spi_cs(false);
++	}
++	rc_spi_cs(true);
++	rc_spi_xfer(hdr, NULL, 3);
++	rc_spi_xfer(buf + i, NULL, size - i);
++	rc_spi_cs(false);
++}
++
++/* ---- the companion firmware from userland (kern.herolte_rcam_fw), standard CRC32 of all but the last 4 bytes ---- */
++static uint32_t
++rc_crc32(const uint8_t *p, size_t n)
++{
++	uint32_t c = 0xffffffffu;
++	for (size_t i = 0; i < n; i++) {
++		c ^= p[i];
++		for (int k = 0; k < 8; k++) {
++			c = (c >> 1) ^ (0xedb88320u & (0u - (c & 1u)));
++		}
++	}
++	return ~c;
++}
++
++static void
++rc_fw_version(const uint8_t *fw, uint32_t len, char *out, size_t outlen)
++{
++	size_t k = 0;
++	for (uint32_t i = len - 16; i < len - 4 && k + 1 < outlen; i++) {
++		out[k++] = (fw[i] >= 32 && fw[i] < 127) ? (char)fw[i] : '?';
++	}
++	out[k] = 0;
++}
++
++static int
++rc_fw_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	if (req->newptr == USER_ADDR_NULL) {
++		int len = (int)rc_fw_len;
++		return SYSCTL_OUT(req, &len, sizeof(len));
++	}
++	if (!kauth_cred_issuser(kauth_cred_get())) {
++		return EPERM;
++	}
++	if (req->newlen < 64 || req->newlen > 1024 * 1024) {
++		printf("rcam: firmware refused: %zu bytes\n", (size_t)req->newlen);
++		return EINVAL;
++	}
++	uint32_t len = (uint32_t)req->newlen;
++	uint8_t *buf = kalloc_data(len, Z_WAITOK);
++	if (!buf) {
++		return ENOMEM;
++	}
++	int error = SYSCTL_IN(req, buf, len);
++	if (error) {
++		kfree_data(buf, len);
++		return error;
++	}
++	uint32_t want = (uint32_t)buf[len - 4] | (uint32_t)buf[len - 3] << 8 | (uint32_t)buf[len - 2] << 16 |
++	    (uint32_t)buf[len - 1] << 24, have = rc_crc32(buf, len - 4);
++	char ver[16];
++	rc_fw_version(buf, len, ver, sizeof(ver));
++	if (want != have) {
++		printf("rcam: firmware refused: %u bytes, CRC32 %#010x but the trailer says %#010x (version \"%s\")\n", len, have,
++		    want, ver);
++		kfree_data(buf, len);
++		return EINVAL;
++	}
++	lck_mtx_lock(&rc_mtx);
++	if (rc_fw) {
++		kfree_data(rc_fw, rc_fw_len);
++	}
++	rc_fw = buf;
++	rc_fw_len = len;
++	lck_mtx_unlock(&rc_mtx);
++	printf("rcam: firmware loaded: %u bytes, CRC32 %#010x matches its trailer, version \"%s\"\n", len, have, ver);
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, herolte_rcam_fw, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    NULL, 0, rc_fw_sysctl, "S", "rear camera: the S5C73C3 companion firmware (root writes it; reads give its length)");
++
++/* ---- stage 1: power on (fimc-is-module-imx260.c sensor_imx260_power_setpin, NORMAL / ON; delays in us) ---- */
++static struct { uint32_t mux, div, en; bool saved; } rc_clksave[2];
++
++static void rc_power_off(void);
++
++static bool
++rc_mclk_on(void)
++{
++	for (unsigned ch = 0; ch < 2; ch++) {           /* SCLK_ISP_SENSOR0 (sensor), SCLK_ISP_SENSOR1 (companion) */
++		uint32_t o = 0xb00 + 0x10 * ch;
++		if (!rc_clksave[ch].saved) {
++			rc_clksave[ch].mux = rc_rd(rc_top, o);
++			rc_clksave[ch].div = rc_rd(rc_top, o + 4);
++			rc_clksave[ch].en = rc_rd(rc_top, o + 0xc);
++			rc_clksave[ch].saved = true;
++		}
++		/* mux bits 14:12 select 0 = OSCCLK (its only parent, pwrcal), bit 21 its gate; divider bits 7:0 = 0: 26 MHz,
++		 * the IMX260 tables' EXCK (0x0136 = 0x1a); CLK_ENABLE_SCLK_ISP_SENSORn bit 0 */
++		rc_wr(rc_top, o, (rc_clksave[ch].mux & ~(7u << 12)) | (1u << 21));
++		for (unsigned n = 0; n < 1000 && ((rc_rd(rc_top, o + 8) >> 12) & 7) != 0; n++) {
++			delay(1);
++		}
++		rc_wr(rc_top, o + 4, rc_clksave[ch].div & ~0xffu);
++		rc_wr(rc_top, o + 0xc, rc_clksave[ch].en | 1u);
++		printf("rcam: MCLK%u: mux %#x -> %#x (status %#x), div %#x -> %#x, enable %#x -> %#x\n", ch, rc_clksave[ch].mux,
++		    rc_rd(rc_top, o), rc_rd(rc_top, o + 8), rc_clksave[ch].div, rc_rd(rc_top, o + 4), rc_clksave[ch].en,
++		    rc_rd(rc_top, o + 0xc));
++	}
++	return true;
++}
++
++static void
++rc_mclk_restore(void)
++{
++	for (unsigned ch = 0; ch < 2; ch++) {
++		uint32_t o = 0xb00 + 0x10 * ch;
++		if (rc_clksave[ch].saved) {
++			rc_wr(rc_top, o + 4, rc_clksave[ch].div);
++			rc_wr(rc_top, o, rc_clksave[ch].mux);
++			rc_wr(rc_top, o + 0xc, rc_clksave[ch].en);
++			rc_clksave[ch].saved = false;
++		}
++	}
++}
++
++static bool
++rc_pmic_ready(void)
++{
++	uint32_t con = rc_rd(rc_pins, B_GPD1);
++	if (((con >> 16) & 0xf) != 2 || ((con >> 20) & 0xf) != 2) {
++		rc_pin(B_GPD1, 4, 2, -1, -1);           /* HSI2C9 on gpd1-4/5, as 0342 does */
++		rc_pin(B_GPD1, 5, 2, -1, -1);
++		printf("rcam: gpd1-4/5 were %#x, now function 2 (con %#x)\n", con, rc_rd(rc_pins, B_GPD1));
++	}
++	rc_bus_init();
++	uint8_t id = 0, b1[2] = { 0, 0 }, bb[2] = { 0, 0 };
++	if (!rc_pmic_read(0x00, &id, 1)) {
++		printf("rcam: the S2MPB02 (0x59 on HSI2C9) does not answer\n");
++		return false;
++	}
++	rc_pmic_read(0x0b, b1, 2);
++	rc_pmic_read(0x0f, bb, 2);
++	printf("rcam: S2MPB02 ID %#x; BUCK1 ctrl %#x volt %#x, BB ctrl %#x volt %#x (about %u mV) as found\n", id, b1[0], b1[1],
++	    bb[0], bb[1], (unsigned)(2600 + (bb[1] & 0x7f) * 25 / 2));
++	return true;
++}
++
++/*
++ * BUCK1 (VDD_1P3_EXT) and the buck-boost BB, "always-on, boot-on" in the DTB, feed the LDOs; nothing keeps them on under
++ * iOS. Exactly the front's writes (0342-notefe-merge.patch lines 2212-2230, notefe_cam_front_id): when BUCK1's enable
++ * bits 7:6 of B1CTRL1 0x0b are not both set, B1CTRL2 0x0c = 0x90 (400 mV + 6.25 mV x 144 = 1.3 V, the DTB's min = max)
++ * then 0x0b = found | 0xc0; when BB's 0x0f is not on and its voltage (BB1CTRL2 0x10 = 2.6 V + 12.5 mV n, as found) is at
++ * most 4.0 V, 0x0f = found | 0xc0; 200 us after each. Put back as found at stage 0 as the front does (lines 2321-2327):
++ * 0x0f, then 0x0b and 0x0c. No other PMIC register.
++ */
++static struct { uint8_t b1[2], bb[2]; bool b1_on, bb_on; } rc_supply;
++
++static void
++rc_supply_on(void)
++{
++	uint8_t b1[2] = { 0, 0 }, bb[2] = { 0, 0 };
++	if (!rc_pmic_read(0x0b, b1, 2) || !rc_pmic_read(0x0f, bb, 2)) {
++		printf("rcam: BUCK1/BB: not read, left alone\n");
++		return;
++	}
++	if ((b1[0] & 0xc0) != 0xc0 && !rc_supply.b1_on) {
++		rc_supply.b1[0] = b1[0];
++		rc_supply.b1[1] = b1[1];
++		rc_supply.b1_on = true;                 /* restored at stage 0 even if a write below fails */
++		if (!(rc_pmic_write(0x0c, 0x90) && rc_pmic_write(0x0b, (uint8_t)(b1[0] | 0xc0)))) {
++			printf("rcam: BUCK1: a write FAILED\n");
++		}
++		delay(200);
++	}
++	if ((bb[0] & 0xc0) != 0xc0 && 2600 + (bb[1] & 0x7f) * 25 / 2 <= 4000 && !rc_supply.bb_on) {
++		rc_supply.bb[0] = bb[0];
++		rc_supply.bb[1] = bb[1];
++		rc_supply.bb_on = true;
++		if (!rc_pmic_write(0x0f, (uint8_t)(bb[0] | 0xc0))) {
++			printf("rcam: BB: the write FAILED\n");
++		}
++		delay(200);
++	}
++	uint8_t c1[2] = { 0, 0 }, cb[2] = { 0, 0 };
++	rc_pmic_read(0x0b, c1, 2);
++	rc_pmic_read(0x0f, cb, 2);
++	printf("rcam: BUCK1 %s (was ctrl %#x volt %#x, now %#x %#x), BB %s (was ctrl %#x volt %#x, now %#x %#x)\n",
++	    rc_supply.b1_on ? "switched ON by rcam" : "left as found", b1[0], b1[1], c1[0], c1[1],
++	    rc_supply.bb_on ? "switched ON by rcam" : "left as found", bb[0], bb[1], cb[0], cb[1]);
++}
++
++static void
++rc_supply_restore(void)
++{
++	if (rc_supply.bb_on) {
++		rc_pmic_write(0x0f, rc_supply.bb[0]);
++		rc_supply.bb_on = false;
++	}
++	if (rc_supply.b1_on) {
++		rc_pmic_write(0x0b, rc_supply.b1[0]);
++		rc_pmic_write(0x0c, rc_supply.b1[1]);
++		rc_supply.b1_on = false;
++	}
++	uint8_t c1[2] = { 0, 0 }, cb[2] = { 0, 0 };
++	rc_pmic_read(0x0b, c1, 2);
++	rc_pmic_read(0x0f, cb, 2);
++	printf("rcam: BUCK1 ctrl %#x volt %#x, BB ctrl %#x volt %#x (as found)\n", c1[0], c1[1], cb[0], cb[1]);
++}
++
++static bool
++rc_power_on(void)
++{
++	if (rc_powered) {
++		printf("rcam: stage 1: already powered\n");
++		return true;
++	}
++	if (!rc_pmic_ready()) {
++		return false;
++	}
++	rc_pins_save();
++	/* sensor_imx260_power_setpin's probe-time state: both resets and the MCLK pins output low */
++	rc_pin(B_GPC1, 0, 1, 0, 0);                     /* "sen_rst low" */
++	rc_pin(B_GPC1, 2, 1, 0, 0);                     /* gpio_prep_reset low */
++	rc_pin(B_GPK0, 0, 1, -1, 0);
++	rc_pin(B_GPK0, 1, 1, -1, 0);
++	rc_pin(B_GPC2, RC_SDA, 0, 0, -1);               /* fimc_is_i2c0_host: function 0 (input), no pull */
++	rc_pin(B_GPC2, RC_SCL, 0, 0, -1);
++	rc_powered = true;                              /* from here rc_power_off() undoes it all */
++	rc_supply_on();
++	bool ok = rc_rail_on(R_L12, 2800000);           /* VDDAF_2.8V_CAM, 2000 */
++	delay(2000);
++	ok = ok && rc_rail_on(R_L11, 1200000);          /* VDDA_2.9V_CAM: 1.2 V first, then 2.875 V */
++	ok = ok && rc_rail_on(R_L11, 2875000);
++	ok = ok && rc_rail_on(R_L17, 1800000);          /* OIS_VDD_1.8V (CAMERA_USE_OIS_VDD_1_8V, hero) */
++	ok = ok && rc_rail_on(R_L15, 2800000);          /* OIS_VDD_2.8V */
++	ok = ok && rc_rail_on(R_L14, 2800000);          /* OIS_VM_2.8V */
++	ok = ok && rc_rail_on(R_L10, 1875000);          /* VDDA_1.8V_CAM */
++	ok = ok && rc_rail_on(R_L3, 1050000);           /* VDDD_1.2V_CAM at 1.05 V */
++	ok = ok && rc_rail_on(R_L7, 1800000);           /* VDDIO_1.8V_CAM */
++	ok = ok && rc_rail_on(R_L9, 1800000);           /* VDDA_1.8V_COMP */
++	ok = ok && rc_rail_on(R_L8, 1800000);           /* VDDIO_1.8V_COMP, 100 */
++	delay(100);
++	ok = ok && rc_rail_on(R_L2, 1000000);           /* VDDD_CORE_1.0V_COMP, 100 */
++	delay(100);
++	ok = ok && rc_rail_on(R_B2, 800000);            /* VDDD_CORE_0.8V_COMP, 100 (the C3 EVT1 default; no binning) */
++	delay(100);
++	ok = ok && rc_rail_on(R_L4, 1050000);           /* VDDD_RET_1.0V_COMP at 1.05 V, 100 */
++	delay(100);
++	ok = ok && rc_rail_on(R_L1, 950000);            /* VDDD_NORET_0.9V_COMP, 100 */
++	delay(100);
++	if (!ok) {
++		printf("rcam: stage 1: a rail failed: everything down again\n");
++		rc_power_off();
++		return false;
++	}
++	rc_mclk_on();
++	rc_pin(B_GPK0, 0, 2, 0, -1);                    /* "pin" 2: fimc_is_mclk0_fn, fimc_is_mclk1_fn, 2000 */
++	rc_pin(B_GPK0, 1, 2, 0, -1);
++	delay(2000);
++	rc_pin(B_GPC1, 2, 1, -1, 1);                    /* "prep_rst high", 300 */
++	delay(300);
++	rc_pin(B_GPC1, 0, 1, -1, 1);                    /* "sen_rst high", 10000 */
++	delay(10000);
++	printf("rcam: stage 1: powered (the flash pins of Samsung's \"pin2\" state, gpc0-2/3, are left alone); gpc1 con %#x "
++	    "dat %#x, gpk0 con %#x, gpc2 con %#x dat %#x\n", rc_rd(rc_pins, B_GPC1), rc_rd(rc_pins, B_GPC1 + 4),
++	    rc_rd(rc_pins, B_GPK0), rc_rd(rc_pins, B_GPC2), rc_rd(rc_pins, B_GPC2 + 4));
++	return true;
++}
++
++static void rc_stream_down(void);
++
++/* the reverse (NORMAL / OFF): VDDAF, sensor reset, MCLK pins, companion reset, then the companion's rails and the
++ * sensor's; every rail, pin and clock back as found */
++static void
++rc_power_off(void)
++{
++	if (rc_streaming) {
++		rc_stream_down();
++	}
++	if (!rc_powered) {
++		printf("rcam: stage 0: nothing powered by rcam\n");
++		return;
++	}
++	rc_rail_restore(R_L12);                         /* VDDAF_2.8V_CAM off, 1000 */
++	delay(1000);
++	rc_pin(B_GPC1, 0, 1, -1, 0);                    /* "sen_rst" low */
++	rc_pin(B_GPK0, 0, 1, 1, 0);                     /* "pin" 1: fimc_is_mclk0_out / mclk1_out (output, pull-down) */
++	rc_pin(B_GPK0, 1, 1, 1, 0);
++	rc_mclk_restore();
++	rc_pin(B_GPC1, 2, 1, -1, 0);                    /* "prep_rst low", 10 */
++	delay(10);
++	rc_rail_restore(R_L1);
++	rc_rail_restore(R_L4);
++	rc_rail_restore(R_B2);
++	rc_rail_restore(R_L2);
++	rc_rail_restore(R_L8);
++	rc_rail_restore(R_L9);
++	rc_rail_restore(R_L11);
++	rc_rail_restore(R_L10);
++	rc_rail_restore(R_L3);
++	rc_rail_restore(R_L7);
++	rc_rail_restore(R_L15);                         /* OIS_VDD_2.8V, 2000 */
++	delay(2000);
++	rc_rail_restore(R_L14);
++	rc_rail_restore(R_L17);
++	rc_supply_restore();
++	rc_pins_restore();
++	rc_powered = rc_booted = rc_configured = false;
++	printf("rcam: stage 0: powered down\n");
++}
++
++/* ---- stage 2: who answers on I2C0 ---- */
++static bool
++rc_probe(void)
++{
++	int id = rc_comp_i2c_rd(0x0000), ver = rc_comp_i2c_rd(0x0002);
++	int m16 = rc_sensor_rd8(0x0016), m17 = rc_sensor_rd8(0x0017);
++	printf("rcam: stage 2: companion (0x3d): ID %s%#x (expected 0x73c3), version %s%#x\n", id < 0 ? "NO ANSWER " : "",
++	    (unsigned)(id < 0 ? 0 : id), ver < 0 ? "NO ANSWER " : "", (unsigned)(ver < 0 ? 0 : ver));
++	printf("rcam: stage 2: IMX260 (0x1a): 0x0016 %s%#x, 0x0017 %s%#x (model id, logged only)\n", m16 < 0 ? "NO ANSWER " : "",
++	    (unsigned)(m16 < 0 ? 0 : m16), m17 < 0 ? "NO ANSWER " : "", (unsigned)(m17 < 0 ? 0 : m17));
++	if (rc_booted && id >= 0) {
++		printf("rcam: stage 2: (the companion runs its firmware: its ID is only logged now)\n");
++	} else if (id != 0x73c3) {
++		printf("rcam: stage 2: the companion is not there as expected: stopped\n");
++		return false;
++	}
++	if (m16 < 0) {
++		printf("rcam: stage 2: the IMX260 does not answer: stopped\n");
++		return false;
++	}
++	return true;
++}
++
++/* ---- stage 3: the companion's firmware (fimc_is_comp_loadfirm + fimc_is_comp_loadsetf) ---- */
++static bool
++rc_spi_check(int id)
++{
++	static const struct { unsigned miso, mosi; } orders[] = { { 6, 7 }, { 7, 6 } };
++	/* the swapped order drives gpc3-6 as an output: only with kern.herolte_rcam_spiswap=1 */
++	for (unsigned o = 0; o < (rc_o_spiswap ? 2u : 1u); o++) {
++		rc_miso = orders[o].miso;
++		rc_mosi = orders[o].mosi;
++		rc_spi_pins();
++		for (unsigned ph = 0; ph < 2; ph++) {
++			rc_spi_two_phase = ph == 0;
++			rc_spi_swap = false;
++			uint16_t v = rc_spi_rd16(0x0000);
++			printf("rcam: stage 3: SPI MISO gpc3-%u MOSI gpc3-%u, %s read of 0x0000: %#06x\n", rc_miso, rc_mosi,
++			    rc_spi_two_phase ? "two-frame" : "one-frame", v);
++			if (v == (uint16_t)id || v == (uint16_t)((id >> 8) | (id << 8))) {
++				rc_spi_swap = v != (uint16_t)id;
++				rc_spi_reads = true;
++				printf("rcam: stage 3: SPI verified by reading (%s)\n", rc_spi_swap ? "bytes swapped" : "big-endian");
++				return true;
++			}
++		}
++		/* no read: does a write land? the CRC engine's seed register (Samsung writes it 0 before every CRC) */
++		rc_spi_wr16(0x6c0c, 0x5a3c);
++		int back = rc_comp_i2c_rd(0x6c0c);
++		rc_spi_wr16(0x6c0c, 0x0000);
++		printf("rcam: stage 3: SPI MISO gpc3-%u MOSI gpc3-%u: write 0x6c0c = 0x5a3c, I2C reads %#x\n", rc_miso, rc_mosi, (unsigned)back);
++		if (back == 0x5a3c) {
++			rc_spi_reads = false;
++			printf("rcam: stage 3: SPI writes verified (reads stay on I2C)\n");
++			return true;
++		}
++	}
++	rc_miso = 6;
++	rc_mosi = 7;
++	rc_spi_pins();                                  /* gpc3-6 an input again */
++	if (!rc_o_spiswap) {
++		printf("rcam: stage 3: the standard SPI order (CLK gpc3-4, SSN gpc3-5, MISO gpc3-6, MOSI gpc3-7) is not "
++		    "verified; the swapped order is tried only with kern.herolte_rcam_spiswap=1\n");
++	}
++	return false;
++}
++
++/* fimc_is_comp_get_crc: the companion's CRC32 over its firmware RAM (0x80000), seed 0 */
++static bool
++rc_comp_crc(uint32_t size, uint32_t *crc)
++{
++	rc_spi_wr16(0x6c0c, 0x0000);
++	rc_spi_wr16(0x6c0e, 0x0000);
++	rc_spi_wr16(0x6c04, 0x0000);                    /* FW_START_ADDR: start 0 */
++	rc_spi_wr16(0x6c06, 0x0000);
++	rc_spi_wr16(0x6c08, (uint16_t)size);
++	rc_spi_wr16(0x6c0a, (uint16_t)(size >> 16));
++	rc_spi_wr16(0x6c00, 0x0001);
++	for (unsigned n = 0; n < 1000; n++) {
++		if (rc_comp_rd(0x6c14) == 0x0001) {
++			rc_spi_wr16(0x6c00, 0x0000);
++			int lo = rc_comp_rd(0x6c0c), hi = rc_comp_rd(0x6c0e);
++			*crc = (uint32_t)(uint16_t)lo | (uint32_t)(uint16_t)hi << 16;
++			return lo >= 0 && hi >= 0;
++		}
++		delay(1000);
++	}
++	rc_spi_wr16(0x6c00, 0x0000);
++	return false;
++}
++
++static bool
++rc_firmware(void)
++{
++	if (rc_booted) {
++		printf("rcam: stage 3: the companion already runs its firmware (version %#x)\n", (unsigned)rc_comp_i2c_rd(0x0002));
++		return true;
++	}
++	if (!rc_fw || rc_fw_len < 64) {
++		printf("rcam: stage 3: no companion firmware (write kern.herolte_rcam_fw first)\n");
++		return false;
++	}
++	int id = rc_comp_i2c_rd(0x0000);
++	if (id != 0x73c3) {
++		printf("rcam: stage 3: companion ID %#x over I2C, not 0x73c3: stopped\n", (unsigned)id);
++		return false;
++	}
++	if (!rc_spi_check(id)) {
++		printf("rcam: stage 3: SPI1 not verified: stopped (nothing uploaded)\n");
++		return false;
++	}
++	uint32_t want = (uint32_t)rc_fw[rc_fw_len - 4] | (uint32_t)rc_fw[rc_fw_len - 3] << 8 |
++	    (uint32_t)rc_fw[rc_fw_len - 2] << 16 | (uint32_t)rc_fw[rc_fw_len - 1] << 24, got = 0;
++	char ver[16];
++	rc_fw_version(rc_fw, rc_fw_len, ver, sizeof(ver));
++	bool crc_ok = false;
++	for (unsigned attempt = 1; attempt <= 3 && !crc_ok; attempt++) {
++		uint64_t t0 = mach_absolute_time(), t1;
++		rc_spi_wr16(0x0008, 0x0001);            /* initialization for download */
++		delay(1000);
++		rc_spi_wr16(0x6428, 0x0008);            /* upload into RAM at 0x0008_0000 */
++		rc_spi_wr16(0x642a, 0x0000);
++		rc_spi_burst(rc_fw, rc_fw_len);
++		t1 = mach_absolute_time();
++		uint64_t ns = 0;
++		absolutetime_to_nanoseconds(t1 - t0, &ns);
++		bool engine = rc_comp_crc(rc_fw_len - 4, &got);
++		uint32_t swapped = (got >> 8 & 0x00ff00ffu) | (got << 8 & 0xff00ff00u);
++		crc_ok = engine && (got == want || swapped == want);
++		printf("rcam: stage 3: upload %u: %u bytes \"%s\" in %llu ms; companion CRC %s%#010x, file %#010x: %s\n", attempt,
++		    rc_fw_len, ver, ns / 1000000, engine ? "" : "(engine timed out) ", got, want,
++		    crc_ok ? (got == want ? "MATCH" : "match with bytes swapped") : "MISMATCH");
++	}
++	printf("rcam: stage 3: skipped as in no Samsung calibration: fimc_is_comp_loadcal (rear/front LSC, PDAF shading "
++	    "from the camera FROM), the cal CRC checks, power binning (BUCK2 stays 0.8 V), C3_CSI_ERROR_RECOVERY (EVT0 only)\n");
++	rc_spi_wr16(0x6048, 0x0001);                    /* ARM reset & memory remap */
++	rc_spi_wr16(0x6014, 0x0001);                    /* ARM go */
++	delay(1000);
++	int v1 = rc_comp_i2c_rd(0x0002);
++	delay(10000);
++	int v2 = rc_comp_i2c_rd(0x0002), id2 = rc_comp_i2c_rd(0x0000);
++	printf("rcam: stage 3: ARM go; version %#x after 1 ms, %#x after 11 ms (EVT0 0xa0, EVT1 0xb0 in the low byte); ID %#x\n",
++	    (unsigned)v1, (unsigned)v2, (unsigned)id2);
++	rc_spi_wr16(0x0044, 0x0000);                    /* no M2M cal data (Samsung's choice when cal is invalid) */
++	/* the master setfile (written over SPI, as Samsung does) and the mode setfile: two 16-bit writes each */
++	rc_spi_wr16(0x6800, 0x0000);
++	rc_spi_wr16(0x0008, 0x0001);
++	delay(1000);
++	rc_spi_wr16(0x0042, 0x0000);
++	rc_spi_wr16(0x6802, 0x0001);
++	printf("rcam: stage 3: master setfile (0x6800 = 0, 0x0008 = 1) and mode setfile (0x0042 = 0, 0x6802 = 1) written; "
++	    "0x0044 reads %#x\n", (unsigned)rc_comp_i2c_rd(0x0044));
++	if (v2 < 0) {
++		printf("rcam: stage 3: the companion does not answer after ARM go: stopped\n");
++		return false;
++	}
++	rc_booted = true;
++	return true;
++}
++
++/* ---- stage 4: the sensor's tables (IMX260_Init of the ISP firmware) and the companion's bypass ---- */
++struct rc_reg8 {
++	uint16_t reg;
++	uint8_t val;
++};
++
++/* sensor_imx260_setfile_A_Global (154 writes) */
++static const struct rc_reg8 rc_imx260_global[] = {
++	{ 0x0136, 0x1a }, { 0x0137, 0x00 }, { 0x304c, 0x00 }, { 0x307d, 0x01 }, { 0x30f0, 0x02 }, { 0x30f1, 0x02 },
++	{ 0x5812, 0x04 }, { 0x5813, 0x04 }, { 0x58d0, 0x07 }, { 0x58e4, 0x01 }, { 0x5e6c, 0x01 }, { 0x5f20, 0x01 },
++	{ 0x5fd5, 0x0e }, { 0x5fd7, 0x62 }, { 0x5fe1, 0x00 }, { 0x5fe3, 0x54 }, { 0x5fe5, 0x0e }, { 0x5fe7, 0x62 },
++	{ 0x5fed, 0x0e }, { 0x5fef, 0x62 }, { 0x687d, 0x8e }, { 0x687e, 0x01 }, { 0x687f, 0xa7 }, { 0x72a1, 0x05 },
++	{ 0x72c9, 0x84 }, { 0x72ce, 0x19 }, { 0x72e2, 0x65 }, { 0x72e3, 0x96 }, { 0x72e4, 0x59 }, { 0x72e8, 0x96 },
++	{ 0x72e9, 0x59 }, { 0x72ea, 0x65 }, { 0x72eb, 0x2d }, { 0x72ec, 0xdd }, { 0x72ed, 0xd9 }, { 0x72ee, 0x7f },
++	{ 0x72ef, 0x9a }, { 0x72f0, 0x17 }, { 0x72f1, 0xf3 }, { 0x72f2, 0x3f }, { 0x72f3, 0xf3 }, { 0x72f4, 0x3f },
++	{ 0x72f7, 0xf3 }, { 0x72f8, 0x3f }, { 0x72fb, 0x2c }, { 0x7333, 0xbf }, { 0x7334, 0xf3 }, { 0x7338, 0xff },
++	{ 0x7339, 0xf6 }, { 0x734a, 0x23 }, { 0x734d, 0x00 }, { 0x734f, 0x64 }, { 0x7350, 0x00 }, { 0x7360, 0x02 },
++	{ 0x7361, 0x30 }, { 0x7363, 0x00 }, { 0x7366, 0x10 }, { 0x7367, 0x00 }, { 0x7368, 0x23 }, { 0x736b, 0x00 },
++	{ 0x736d, 0x39 }, { 0x736e, 0x00 }, { 0x7377, 0x23 }, { 0x737a, 0x00 }, { 0x737c, 0x64 }, { 0x737d, 0x00 },
++	{ 0x7441, 0x84 }, { 0x7447, 0x62 }, { 0x744f, 0x0e }, { 0x747d, 0x3a }, { 0x7483, 0x54 }, { 0x748b, 0x00 },
++	{ 0x7491, 0x60 }, { 0x7497, 0x62 }, { 0x749f, 0x0e }, { 0x74b9, 0x55 }, { 0x74bf, 0x62 }, { 0x74c7, 0x0e },
++	{ 0x7932, 0x00 }, { 0x7937, 0x01 }, { 0x793c, 0x01 }, { 0x793d, 0x02 }, { 0x7947, 0x03 }, { 0x811f, 0x01 },
++	{ 0x9333, 0x03 }, { 0x9334, 0x04 }, { 0x9335, 0x05 }, { 0x9346, 0x96 }, { 0x934a, 0x8c }, { 0x9352, 0xaa },
++	{ 0xb011, 0x00 }, { 0xb01e, 0x00 }, { 0xb01f, 0x00 }, { 0xb020, 0x00 }, { 0xb021, 0x00 }, { 0xb03c, 0x03 },
++	{ 0xb03d, 0x03 }, { 0xb03e, 0x03 }, { 0xb03f, 0x03 }, { 0xb0b6, 0x05 }, { 0xb0b7, 0x05 }, { 0xb0b8, 0x06 },
++	{ 0xb0b9, 0x05 }, { 0xb0ba, 0x06 }, { 0xb0bb, 0x06 }, { 0xb0bc, 0x06 }, { 0xb0bd, 0x06 }, { 0xb0be, 0x06 },
++	{ 0xb0bf, 0x06 }, { 0xb0c0, 0x06 }, { 0xb0c1, 0x06 }, { 0xb0c2, 0x06 }, { 0xb0c3, 0x06 }, { 0xb0c4, 0x06 },
++	{ 0xb0c5, 0x06 }, { 0xb0e0, 0x31 }, { 0xb0e1, 0x31 }, { 0xb0e3, 0x26 }, { 0xb0f1, 0x05 }, { 0xbc7b, 0xd4 },
++	{ 0xbc81, 0x74 }, { 0xbc83, 0x44 }, { 0xbc86, 0x07 }, { 0xbc87, 0x18 }, { 0x5e64, 0x01 }, { 0x5fe0, 0x00 },
++	{ 0x5fe1, 0xfb }, { 0x5fe3, 0x4f }, { 0x628d, 0x01 }, { 0x6434, 0x01 }, { 0x6435, 0x22 }, { 0x6436, 0x00 },
++	{ 0x6437, 0xc5 }, { 0x6604, 0x01 }, { 0x6605, 0x22 }, { 0x6606, 0x00 }, { 0x6607, 0xc5 }, { 0x660c, 0x00 },
++	{ 0x660d, 0x00 }, { 0x660e, 0x03 }, { 0x660f, 0xff }, { 0x6614, 0x00 }, { 0x6615, 0xd3 }, { 0x6616, 0x01 },
++	{ 0x6617, 0x22 }, { 0x6b7d, 0x32 }, { 0x7366, 0xb0 }, { 0x7483, 0x4f }, { 0x748a, 0x00 }, { 0x748b, 0xfb },
++	{ 0xbc81, 0x60 }, { 0x5e6f, 0x3f }, { 0x5e72, 0x01 }, { 0x7912, 0x01 },
++};
++
++/* IMX260_Init of the ISP firmware, between the global table and the mode table */
++static const struct rc_reg8 rc_imx260_extra[] = {
++	{ 0x40ad, 0x01 }, { 0x40b8, 0x02 }, { 0x40b9, 0x01 }, { 0x40ba, 0x03 }, { 0x40bb, 0x00 },
++};
++
++/* sensor_imx260_setfile_A_2016x1512_30fps: mode 7, 2016x1512 30 fps, RAW10, 4 lanes (57 writes) */
++static const struct rc_reg8 rc_imx260_mode7[] = {
++	{ 0x9007, 0x00 }, { 0x30f2, 0x00 }, { 0x0112, 0x0a }, { 0x0113, 0x0a }, { 0x0114, 0x03 }, { 0x0220, 0x00 },
++	{ 0x0221, 0x11 }, { 0x0340, 0x06 }, { 0x0341, 0x40 }, { 0x0342, 0x44 }, { 0x0343, 0x00 }, { 0x0381, 0x01 },
++	{ 0x0383, 0x01 }, { 0x0385, 0x01 }, { 0x0387, 0x01 }, { 0x0900, 0x01 }, { 0x0901, 0x22 }, { 0x30f4, 0x02 },
++	{ 0x30f5, 0x8a }, { 0x30f6, 0x00 }, { 0x30f7, 0x14 }, { 0x31a0, 0x02 }, { 0x31a3, 0x01 }, { 0x31a5, 0x00 },
++	{ 0x31a6, 0x00 }, { 0x560f, 0xc8 }, { 0x0344, 0x00 }, { 0x0345, 0x00 }, { 0x0346, 0x00 }, { 0x0347, 0x00 },
++	{ 0x0348, 0x0f }, { 0x0349, 0xbf }, { 0x034a, 0x0b }, { 0x034b, 0xcf }, { 0x034c, 0x07 }, { 0x034d, 0xe0 },
++	{ 0x034e, 0x05 }, { 0x034f, 0xe8 }, { 0x0408, 0x00 }, { 0x0409, 0x00 }, { 0x040a, 0x00 }, { 0x040b, 0x00 },
++	{ 0x040c, 0x07 }, { 0x040d, 0xe0 }, { 0x040e, 0x05 }, { 0x040f, 0xe8 }, { 0x0301, 0x03 }, { 0x0303, 0x02 },
++	{ 0x0305, 0x04 }, { 0x0306, 0x00 }, { 0x0307, 0xc1 }, { 0x0309, 0x0a }, { 0x030b, 0x01 }, { 0x030d, 0x04 },
++	{ 0x030e, 0x01 }, { 0x030f, 0x3c }, { 0x0310, 0x01 },
++};
++
++/* mode 3, 4032x2268 60 fps: this phone's ISP firmware table (the public setA 4032x2268_60fps differs); not used by
++ * default (kern.herolte_rcam_mode=3) (57 writes) */
++static const struct rc_reg8 rc_imx260_mode3[] = {
++	{ 0x9007, 0x00 }, { 0x30f2, 0x00 }, { 0x0112, 0x0a }, { 0x0113, 0x0a }, { 0x0114, 0x03 }, { 0x0220, 0x61 },
++	{ 0x0221, 0x11 }, { 0x0340, 0x09 }, { 0x0341, 0x8c }, { 0x0342, 0x16 }, { 0x0343, 0x44 }, { 0x0381, 0x01 },
++	{ 0x0383, 0x01 }, { 0x0385, 0x01 }, { 0x0387, 0x01 }, { 0x0900, 0x00 }, { 0x0901, 0x11 }, { 0x30f4, 0x02 },
++	{ 0x30f5, 0xbc }, { 0x30f6, 0x02 }, { 0x30f7, 0x8a }, { 0x31a0, 0x02 }, { 0x31a3, 0x01 }, { 0x31a5, 0x00 },
++	{ 0x31a6, 0x00 }, { 0x560f, 0xe6 }, { 0x0344, 0x00 }, { 0x0345, 0x00 }, { 0x0346, 0x01 }, { 0x0347, 0x78 },
++	{ 0x0348, 0x0f }, { 0x0349, 0xbf }, { 0x034a, 0x0a }, { 0x034b, 0x57 }, { 0x034c, 0x0f }, { 0x034d, 0xc0 },
++	{ 0x034e, 0x08 }, { 0x034f, 0xdc }, { 0x0408, 0x00 }, { 0x0409, 0x00 }, { 0x040a, 0x00 }, { 0x040b, 0x00 },
++	{ 0x040c, 0x0f }, { 0x040d, 0xc0 }, { 0x040e, 0x08 }, { 0x040f, 0xe0 }, { 0x0301, 0x03 }, { 0x0303, 0x02 },
++	{ 0x0305, 0x04 }, { 0x0306, 0x00 }, { 0x0307, 0xc1 }, { 0x0309, 0x0a }, { 0x030b, 0x01 }, { 0x030d, 0x04 },
++	{ 0x030e, 0x01 }, { 0x030f, 0x3c }, { 0x0310, 0x01 },
++};
++
++#define RC_N(t) ((unsigned)(sizeof(t) / sizeof((t)[0])))
++
++/* mode -> frame size and Samsung's CSIS values (fimc-is-module-imx260.c config_imx260[]: settle, mipi_speed) */
++static uint32_t rc_w = 2016, rc_h = 1512, rc_mode_settle = 30;
++static bool rc_mode_deskew;
++
++static unsigned
++rc_write_table(const struct rc_reg8 *t, unsigned n)
++{
++	unsigned bad = 0;
++	for (unsigned i = 0; i < n; i++) {
++		bad += !rc_sensor_wr8(t[i].reg, t[i].val);
++	}
++	return bad;
++}
++
++static bool
++rc_sensor_init(void)
++{
++	if (!rc_booted) {
++		printf("rcam: stage 4: the companion has no firmware yet (stage 3): stopped\n");
++		return false;
++	}
++	if (rc_streaming) {
++		rc_stream_down();
++	}
++	unsigned mode = rc_o_mode == 3 ? 3 : 7;
++	if (rc_o_mode != mode) {
++		printf("rcam: stage 4: mode %u is not embedded; mode 7\n", rc_o_mode);
++	}
++	rc_w = mode == 3 ? 4032 : 2016;
++	rc_h = mode == 3 ? 2268 : 1512;
++	rc_mode_settle = mode == 3 ? 45 : 30;           /* FIMC_IS_SENSOR_CFG_EXT(4032, 2268, 60, 45, 3, 4 lanes, 2145) */
++	rc_mode_deskew = mode == 3;                     /* FIMC_IS_SENSOR_CFG(2016, 1512, 30, 30, 7, 4 lanes): mipi_speed 0 */
++	int id = rc_sensor_rd16(0x0016);
++	printf("rcam: stage 4: IMX260 0x0016/7 %#x; standby (0x0100 = 0): %s\n", (unsigned)id, rc_sensor_wr8(0x0100, 0x00) ? "ok" : "NACK");
++	unsigned bg = rc_write_table(rc_imx260_global, RC_N(rc_imx260_global));
++	unsigned be = rc_write_table(rc_imx260_extra, RC_N(rc_imx260_extra));
++	unsigned bm = mode == 3 ? rc_write_table(rc_imx260_mode3, RC_N(rc_imx260_mode3)) :
++	    rc_write_table(rc_imx260_mode7, RC_N(rc_imx260_mode7));
++	printf("rcam: stage 4: global %u writes (%u NACK), extra %u (%u NACK), mode %u %u writes (%u NACK)\n",
++	    RC_N(rc_imx260_global), bg, RC_N(rc_imx260_extra), be, mode, mode == 3 ? RC_N(rc_imx260_mode3) : RC_N(rc_imx260_mode7),
++	    bm);
++	printf("rcam: stage 4: read back: EXCK %#x, format %#x, lanes-1 %d, output %d x %d, FLL %d, LLP %d, binning %d/%#x, "
++	    "PLL ivt %d/%d iop %d/%d\n", (unsigned)rc_sensor_rd16(0x0136), (unsigned)rc_sensor_rd16(0x0112), rc_sensor_rd8(0x0114),
++	    rc_sensor_rd16(0x034c), rc_sensor_rd16(0x034e), rc_sensor_rd16(0x0340), rc_sensor_rd16(0x0342),
++	    rc_sensor_rd8(0x0900), (unsigned)rc_sensor_rd8(0x0901), rc_sensor_rd8(0x0305), rc_sensor_rd16(0x0306), rc_sensor_rd8(0x030d),
++	    rc_sensor_rd16(0x030e));
++	/* the companion's bypass (from the ISP firmware, an inference): 0x003a = 0x0099 on, 0 off */
++	int before = rc_comp_i2c_rd(0x003a);
++	bool w = rc_comp_i2c_wr(0x003a, (uint16_t)rc_o_bypass);
++	if (!w) {
++		rc_spi_wr16(0x003a, (uint16_t)rc_o_bypass);
++	}
++	int after = rc_comp_i2c_rd(0x003a);
++	printf("rcam: stage 4: companion 0x003a: was %#x, wrote %#x over %s, reads %#x: %s\n", (unsigned)before, rc_o_bypass,
++	    w ? "I2C" : "SPI (I2C NACK)", (unsigned)after, after == (int)(uint16_t)rc_o_bypass ? "bypass set" : "NOT as written");
++	if (bg || be || bm) {
++		printf("rcam: stage 4: some sensor writes were not acknowledged: stopped\n");
++		return false;
++	}
++	rc_configured = true;
++	return true;
++}
++
++/* ---- stage 5: CSIS0 + D-PHY + SysMMU, stream, one frame ---- */
++static const struct { bool local; uint16_t off; uint32_t mask; const char *name; } rc_gates[] = {
++	{ false, 0x800, 1u << 0, "ACLK_CSIS0" }, { true, 0x800, 1u << 0, "ACLK_CSIS0 (local)" },
++	{ false, 0x83c, 1u << 0, "PCLK_CSIS0" }, { true, 0x83c, 1u << 0, "PCLK_CSIS0 (local)" },
++	{ false, 0x848, 1u << 0, "HS0_CSIS0_RX_BYTE" }, { false, 0x84c, 1u << 0, "HS1_CSIS0_RX_BYTE" },
++	{ false, 0x850, 1u << 0, "HS2_CSIS0_RX_BYTE" }, { false, 0x854, 1u << 0, "HS3_CSIS0_RX_BYTE" },
++	{ false, 0x838, 0xfu, "TREX_528 (LH_ASYNC_SI_CAM0, TREX_A, SysMMU6, SFW110)" },
++	{ false, 0x840, 0x3u, "PCLK TREX_132 (SFW110, SysMMU6)" },
++};
++#define RC_NGATES (sizeof(rc_gates) / sizeof(rc_gates[0]))
++static struct {
++	uint32_t gate[RC_NGATES], rx_mux[4], csis_user, mmu_ctrl, iso, phyc;
++	bool saved;
++} rc_rx;
++
++static void
++rc_csis_report(const char *when)
++{
++	uint32_t s0 = rc_rd(rc_csis, 0x14), s1 = rc_rd(rc_csis, 0x1c);
++	int fc = rc_sensor_rd8(0x0005);
++	printf("rcam: frame %s: CSIS0 INT_SRC0 %#x: ch0 start %u end %u; errors SOT_HS %u lost FS %u lost FE %u overflow %u "
++	    "wrong cfg %u ECC %u CRC %u ID %u; INT_SRC1 %#x: DMA start %u end %u error %u\n", when, s0, (s0 >> 24) & 1,
++	    (s0 >> 20) & 1, (s0 >> 16) & 1, (s0 >> 12) & 1, (s0 >> 8) & 1, (s0 >> 4) & 1, (s0 >> 3) & 1, (s0 >> 2) & 1,
++	    (s0 >> 1) & 1, s0 & 1, s1, (s1 >> 4) & 1, (s1 >> 8) & 1, (s1 >> 12) & 1);
++	printf("rcam: frame %s: FRM_CNT_CH0 %u, DPHY_STATUS %#x, DMA0 ctrl %#x act_ctrl %#x byte count %u, DMA err %#x; "
++	    "sensor frame count %d; SysMMU status %#x\n", when, rc_rd(rc_csis, 0x100), rc_rd(rc_csis, 0x20),
++	    rc_rd(rc_csis, 0x1000), rc_rd(rc_csis, 0x1030), rc_rd(rc_csis, 0x1040), rc_rd(rc_csis, 0x1404), fc,
++	    rc_rd(rc_mmu, 8));
++}
++
++/* Samsung's csi_stream_on order (fimc-is-device-csi_v2.c, fimc-is-hw-csi-v4_0.c), 0342's nc_csis_setup for 4 lanes */
++static void
++rc_csis_setup(uint32_t settle, bool deskew)
++{
++	vm_offset_t c = rc_csis;
++	rc_wr(c, 0x4, rc_rd(c, 0x4) & ~1u);                             /* CSI_EN off */
++	rc_wr(c, 0x24, rc_rd(c, 0x24) & ~1u);                           /* ENABLE_CLK off */
++	rc_wr(c, 0x4, rc_rd(c, 0x4) | 2u);                              /* SW_RESET */
++	for (unsigned n = 0; n < 100 && (rc_rd(c, 0x4) & 2u); n++) {
++		delay(10);
++	}
++	for (unsigned vc = 0; vc < 4; vc++) {                           /* every VC's DMA off */
++		rc_wr(c, 0x1000 + vc * 0x100, (rc_rd(c, 0x1000 + vc * 0x100) | 1u) & ~2u);
++	}
++	/* DPHY_CMN_CTRL: HSSETTLE 31:24, ENABLE_DAT 4:1 = 0xf (4 lanes) */
++	rc_wr(c, 0x24, (rc_rd(c, 0x24) & ~(0xffu << 24) & ~(0xfu << 1) & ~(1u << 21)) | ((settle & 0xff) << 24) | (0xfu << 1));
++	/* CSIS_CMN_CTRL: LANE_NUMBER 9:8 = 3, INTERLEAVE 11:10 = 0 (CH0 only), DESKEW_ENABLE 12 */
++	rc_wr(c, 0x4, (rc_rd(c, 0x4) & ~(3u << 8) & ~(1u << 12) & ~(3u << 10)) | (3u << 8) | (deskew ? (1u << 12) : 0));
++	if (deskew) {
++		/* csi_hw_s_lane for > 1.5 Gbps: S_DPHYCTL_H [33] skew calibration, [39:34] 0x24, [63:60] 3; S_BYTE_CLK_ENABLE */
++		rc_wr(c, 0x3c, (rc_rd(c, 0x3c) & ~0xf00000feu) | (1u << 1) | (0x24u << 2) | (0x3u << 28));
++		rc_wr(c, 0x24, rc_rd(c, 0x24) | (1u << 21));
++	}
++	/* ISP_CONFIG_CH0: VC 0, DATAFORMAT 0x2b (RAW10) at 7:2, DOUBLE_CMPNT 12; ISP_RESOL_CH0 */
++	rc_wr(c, 0x40, (rc_rd(c, 0x40) & ~0x1fffu) | (0x2bu << 2) | (1u << 12));
++	rc_wr(c, 0x44, (rc_h << 16) | rc_w);
++	/* DMA0_FMT: 2D, normal packing (16 bits a pixel), as the front; ADDR1 = slot 0 (the first frame), ADDR2-8 = slot 1 */
++	rc_wr(c, 0x1004, rc_rd(c, 0x1004) & ~(3u << 14));
++	rc_wr(c, 0x1010, RC_BUF);
++	for (uint32_t a = 0x1014; a <= 0x102c; a += 4) {
++		rc_wr(c, a, RC_BUF + RC_SLOT);
++	}
++	rc_wr(c, 0x1000, (rc_rd(c, 0x1000) & ~1u) | 2u);               /* DMA0 on, pointer update */
++	rc_wr(c, 0x14, rc_rd(c, 0x14));                                 /* clear what is pending */
++	rc_wr(c, 0x1c, rc_rd(c, 0x1c));
++	rc_wr(c, 0x4, rc_rd(c, 0x4) | (0xfu << 16));                    /* UPDATE_SHADOW */
++	rc_wr(c, 0x24, rc_rd(c, 0x24) | 1u);                            /* D-PHY clock lane on */
++	rc_wr(c, 0x4, rc_rd(c, 0x4) | 1u);                              /* CSI_EN */
++}
++
++/* the receiver down and every register of it as found */
++static void
++rc_rx_down(void)
++{
++	if (!rc_rx.saved) {
++		return;
++	}
++	vm_offset_t c = rc_csis;
++	rc_wr(c, 0x1000, rc_rd(c, 0x1000) | 1u);
++	rc_wr(c, 0x4, rc_rd(c, 0x4) & ~1u);
++	rc_wr(c, 0x24, rc_rd(c, 0x24) & ~0x1fu);
++	rc_wr(c, 0x4, rc_rd(c, 0x4) | 2u);
++	delay(100);
++	for (unsigned n = 0; n < 4; n++) {
++		rc_wr(rc_cam0, 0x220 + 4 * n, rc_rx.rx_mux[n]);
++	}
++	rc_wr(rc_phy, 0x40, rc_rx.phyc & ~2u);
++	rc_wr(rc_phy, 0x40, rc_rx.phyc);
++	if (!(rc_rx.iso & 1u)) {                        /* 0x70c is the DSI's too: only cleared if rcam set it */
++		rc_wr(rc_pmu, 0x70c, rc_rd(rc_pmu, 0x70c) & ~1u);
++	}
++	rc_wr(rc_mmu, 0, rc_rx.mmu_ctrl);
++	for (unsigned i = 0; i < RC_NGATES; i++) {
++		vm_offset_t b = rc_gates[i].local ? rc_cam0l : rc_cam0;
++		rc_wr(b, rc_gates[i].off, (rc_rd(b, rc_gates[i].off) & ~rc_gates[i].mask) | (rc_rx.gate[i] & rc_gates[i].mask));
++	}
++	rc_wr(rc_cam0, 0x200, rc_rx.csis_user);
++	rc_rx.saved = false;
++	printf("rcam: receiver as found (SysMMU ctrl %#x, PHY %#x, PMU 0x70c %#x)\n", rc_rd(rc_mmu, 0), rc_rd(rc_phy, 0x40),
++	    rc_rd(rc_pmu, 0x70c));
++}
++
++static void
++rc_stream_down(void)
++{
++	rc_sensor_wr8(0x0100, 0x00);
++	delay(50000);
++	rc_rx_down();
++	rc_streaming = false;
++	printf("rcam: stream off\n");
++}
++
++/* the captured frame (slot 0) for userland: kern.herolte_rcam_pic_info / _pic / _pic_off */
++static struct {
++	bool valid;
++	uint32_t w, h, frame_bytes, bytes, changed, mn, mx, mean, untouched, dma_bytes, frames, mode;
++} rc_pic;
++
++static void
++rc_frame_stats(const char *what, vm_offset_t slot, uint32_t fbytes, bool keep)
++{
++	volatile uint16_t *px = (volatile uint16_t *)slot;
++	uint32_t mn = 0xffff, mx = 0, untouched = 0;
++	uint64_t sum = 0;
++	for (unsigned i = 0; i < 2048; i++) {           /* the first 4 KiB */
++		uint16_t v = px[i];
++		if (v == 0xa5a5) {
++			untouched++;
++		}
++		v &= 0x3ff;
++		mn = MIN(mn, v);
++		mx = MAX(mx, v);
++		sum += v;
++	}
++	uint32_t changed = 0, last = 0;
++	for (uint32_t o = 0; o < fbytes; o += 4) {
++		if (*(volatile uint32_t *)(slot + o) != 0xa5a5a5a5u) {
++			changed++;
++			last = o;
++		}
++	}
++	volatile uint32_t *w = (volatile uint32_t *)slot;
++	printf("rcam: %s: %u of %u bytes written (the last at +%#x, a frame ends at +%#x); first 4 KiB (2048 pixels & 0x3ff): "
++	    "min %u max %u mean %llu, %u still 0xa5a5; first words %08x %08x %08x %08x\n", what, changed * 4, fbytes, last,
++	    fbytes - 4, mn, mx, sum / 2048, untouched, w[0], w[1], w[2], w[3]);
++	if (keep) {
++		rc_pic.w = rc_w;
++		rc_pic.h = rc_h;
++		rc_pic.frame_bytes = fbytes;
++		rc_pic.bytes = changed ? last + 4 : 0;  /* up to the last word the DMA changed */
++		rc_pic.changed = changed * 4;
++		rc_pic.mn = mn;
++		rc_pic.mx = mx;
++		rc_pic.mean = (uint32_t)(sum / 2048);
++		rc_pic.untouched = untouched;
++		rc_pic.valid = changed != 0;
++	}
++}
++
++static uint32_t rc_pic_off;
++SYSCTL_UINT(_kern, OID_AUTO, herolte_rcam_pic_off, CTLFLAG_RW | CTLFLAG_LOCKED, &rc_pic_off, 0,
++    "rear camera: the offset in the frame that kern.herolte_rcam_pic reads from");
++
++static int
++rc_pic_info_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char text[512];
++	lck_mtx_lock(&rc_mtx);
++	if (!rc_pic.valid) {
++		lck_mtx_unlock(&rc_mtx);
++		return ENOENT;
++	}
++	int n = snprintf(text, sizeof(text), "width %u\nheight %u\nbytes_per_pixel 2\nformat RAW10 in bits 9:0, little-endian, "
++	    "Bayer order unknown\nmode %u\nbytes %u\nframe_bytes %u\nchanged_bytes %u\ndma_byte_count %u\nframes_counted %u\n"
++	    "first4k_min %u\nfirst4k_max %u\nfirst4k_mean %u\nfirst4k_untouched %u\nphys %#x\n", rc_pic.w, rc_pic.h, rc_pic.mode,
++	    rc_pic.bytes, rc_pic.frame_bytes, rc_pic.changed, rc_pic.dma_bytes, rc_pic.frames, rc_pic.mn, rc_pic.mx, rc_pic.mean,
++	    rc_pic.untouched, RC_BUF);
++	lck_mtx_unlock(&rc_mtx);
++	return SYSCTL_OUT(req, text, (size_t)MIN(n, (int)sizeof(text) - 1) + 1);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, herolte_rcam_pic_info, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    NULL, 0, rc_pic_info_sysctl, "A", "rear camera: the captured frame's size and stats (text)");
++
++/* as 0342's notefe_cam_pic (root, opaque), but in chunks: up to 1 MiB of slot 0 from kern.herolte_rcam_pic_off */
++static int
++rc_pic_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	if (!kauth_cred_issuser(kauth_cred_get())) {
++		return EPERM;
++	}
++	lck_mtx_lock(&rc_mtx);
++	if (!rc_pic.valid || !rc_ring) {
++		lck_mtx_unlock(&rc_mtx);
++		return ENOENT;
++	}
++	uint32_t off = rc_pic_off, n = off < rc_pic.bytes ? MIN(rc_pic.bytes - off, 1024u * 1024u) : 0;
++	int error = SYSCTL_OUT(req, (const void *)(rc_ring + off), n);
++	lck_mtx_unlock(&rc_mtx);
++	return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, herolte_rcam_pic, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    NULL, 0, rc_pic_sysctl, "S", "rear camera: the captured frame (slot 0, 16 bits a pixel), up to 1 MiB from _pic_off");
++
++static bool
++rc_capture(void)
++{
++	if (!rc_configured) {
++		printf("rcam: stage 5: the sensor is not set up (stage 4): stopped\n");
++		return false;
++	}
++	if (rc_streaming) {
++		printf("rcam: stage 5: still streaming from before: stream off first\n");
++		rc_stream_down();
++	}
++	/* the camera domains: no CMU_CAM0 / CSIS0 register is touched while they are off */
++	uint32_t c0 = rc_rd(rc_pmu, 0x4024), c1 = rc_rd(rc_pmu, 0x40a4);
++	printf("rcam: stage 5: domains cam0 config %#x status %#x, cam1 config %#x status %#x\n", rc_rd(rc_pmu, 0x4020), c0,
++	    rc_rd(rc_pmu, 0x40a0), c1);
++	if ((c0 & 0xf) != 0xf || (c1 & 0xf) != 0xf) {
++		printf("rcam: stage 5: a camera power domain is off: stopped (rcam does not switch domains)\n");
++		return false;
++	}
++	if (!rc_csis) {
++		rc_csis = ml_io_map(RC_CSIS0, 0x2000);
++		rc_cam0 = ml_io_map(RC_CAM0, 0x1000);
++		rc_cam0l = ml_io_map(RC_CAM0L, 0x1000);
++		rc_phy = ml_io_map(RC_PHY0, 0x1000);
++		rc_mmu = ml_io_map(RC_MMU, 0x1000);
++	}
++	if (!rc_ring) {
++		rc_ring = notefe_physmap(RC_BUF, RC_MAP_LEN);
++	}
++	if (!rc_csis || !rc_cam0 || !rc_cam0l || !rc_phy || !rc_mmu || !rc_ring) {
++		printf("rcam: stage 5: map failed\n");
++		return false;
++	}
++	/* clocks: CSIS0's user mux must come from CMU_TOP's ACLK_CAM0_CSIS0_414 (mux 0x2b8 bit 21, div 0x418, gate 0x878) */
++	uint32_t tmux = rc_rd(rc_top, 0x2b8), tdiv = rc_rd(rc_top, 0x418), tgate = rc_rd(rc_top, 0x878);
++	uint32_t user = rc_rd(rc_cam0, 0x200);
++	printf("rcam: stage 5: TOP ACLK_CAM0_CSIS0_414 mux %#x div %#x gate %#x; CAM0 user mux %#x (status %#x), TREX_528 user "
++	    "%#x\n", tmux, tdiv, tgate, user, rc_rd(rc_cam0, 0x600), rc_rd(rc_cam0, 0x21c));
++	if (!((user >> 12) & 1) && (!(tgate & 1) || !((tmux >> 21) & 1))) {
++		printf("rcam: stage 5: CSIS0's clock is OSCCLK and the TOP clock is gated: stopped (CMU_TOP not written)\n");
++		return false;
++	}
++	rc_rx.csis_user = user;
++	for (unsigned i = 0; i < RC_NGATES; i++) {
++		vm_offset_t b = rc_gates[i].local ? rc_cam0l : rc_cam0;
++		rc_rx.gate[i] = rc_rd(b, rc_gates[i].off);
++		if ((rc_rx.gate[i] & rc_gates[i].mask) != rc_gates[i].mask) {
++			rc_wr(b, rc_gates[i].off, rc_rx.gate[i] | rc_gates[i].mask);
++		}
++		printf("rcam: stage 5: gate %s %#x -> %#x\n", rc_gates[i].name, rc_rx.gate[i], rc_rd(b, rc_gates[i].off));
++	}
++	if (!((user >> 12) & 1)) {
++		rc_wr(rc_cam0, 0x200, user | (1u << 12));
++		for (unsigned n = 0; n < 1000 && ((rc_rd(rc_cam0, 0x600) >> 12) & 7) != 2; n++) {
++			delay(1);
++		}
++		printf("rcam: stage 5: CSIS0 user mux to the TOP clock: %#x (status %#x)\n", rc_rd(rc_cam0, 0x200), rc_rd(rc_cam0, 0x600));
++	}
++	rc_rx.saved = true;                             /* from here rc_rx_down() puts it all back */
++	rc_pic.valid = false;
++	uint32_t fbytes = rc_w * rc_h * 2;
++	for (uint32_t o = 0; o < fbytes; o += 4) {
++		*(volatile uint32_t *)(rc_ring + o) = 0xa5a5a5a5u;
++		*(volatile uint32_t *)(rc_ring + RC_SLOT + o) = 0xa5a5a5a5u;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");      /* the pattern in DRAM before the DMA can start */
++	/* SysMMU 0x140e0000 to bypass (CTRL_DISABLE), PHY isolation bypass (PMU 0x70c bit 0) and reset released (bit 1),
++	 * the four lane byte clocks from the PHY (user mux select 1, bit 12) */
++	rc_rx.mmu_ctrl = rc_rd(rc_mmu, 0);
++	rc_rx.iso = rc_rd(rc_pmu, 0x70c);
++	rc_rx.phyc = rc_rd(rc_phy, 0x40);
++	rc_wr(rc_mmu, 0, 0);
++	rc_wr(rc_pmu, 0x70c, rc_rx.iso | 1u);
++	rc_wr(rc_phy, 0x40, rc_rx.phyc & ~2u);
++	rc_wr(rc_phy, 0x40, rc_rx.phyc | 2u);
++	for (unsigned n = 0; n < 4; n++) {
++		rc_rx.rx_mux[n] = rc_rd(rc_cam0, 0x220 + 4 * n);
++		rc_wr(rc_cam0, 0x220 + 4 * n, rc_rx.rx_mux[n] | (1u << 12));
++	}
++	uint32_t settle = rc_o_settle ? rc_o_settle : rc_mode_settle;
++	bool deskew = rc_o_deskew == 2 ? true : rc_o_deskew == 1 ? false : rc_mode_deskew;
++	printf("rcam: stage 5: %u x %u RAW10, 4 lanes, settle %u (%s), deskew %s (%s); lane byte clock muxes %#x %#x %#x %#x -> "
++	    "%#x %#x %#x %#x; PHY %#x -> %#x, PMU 0x70c %#x -> %#x, SysMMU %#x -> %#x; CSIS0 version %#x\n", rc_w, rc_h, settle,
++	    rc_o_settle ? "kern.herolte_rcam_settle" : "Samsung's config_imx260 for this mode", deskew ? "on" : "off",
++	    rc_o_deskew ? "kern.herolte_rcam_deskew" : "Samsung: mipi_speed > 1500 only", rc_rx.rx_mux[0], rc_rx.rx_mux[1],
++	    rc_rx.rx_mux[2], rc_rx.rx_mux[3], rc_rd(rc_cam0, 0x220), rc_rd(rc_cam0, 0x224), rc_rd(rc_cam0, 0x228),
++	    rc_rd(rc_cam0, 0x22c), rc_rx.phyc, rc_rd(rc_phy, 0x40), rc_rx.iso, rc_rd(rc_pmu, 0x70c), rc_rx.mmu_ctrl,
++	    rc_rd(rc_mmu, 0), rc_rd(rc_csis, 0));
++	rc_csis_setup(settle, deskew);
++	printf("rcam: stage 5: CSIS0 set: CMN %#x DPHY_CMN %#x SCTRL_H %#x CH0 %#x/%#x, INT_MSK0 %#x MSK1 %#x, DMA0 ctrl %#x fmt "
++	    "%#x addr1 %#x addr2 %#x\n", rc_rd(rc_csis, 0x4), rc_rd(rc_csis, 0x24), rc_rd(rc_csis, 0x3c), rc_rd(rc_csis, 0x40),
++	    rc_rd(rc_csis, 0x44), rc_rd(rc_csis, 0x10), rc_rd(rc_csis, 0x18), rc_rd(rc_csis, 0x1000), rc_rd(rc_csis, 0x1004),
++	    rc_rd(rc_csis, 0x1010), rc_rd(rc_csis, 0x1014));
++	uint32_t f0 = rc_rd(rc_csis, 0x100);
++	rc_streaming = true;
++	bool on = rc_sensor_wr8(0x0100, 0x01);
++	uint64_t t0 = mach_absolute_time();
++	printf("rcam: stage 5: stream on (0x0100 = 1): %s; FRM_CNT_CH0 %u before\n", on ? "ok" : "NACK", f0);
++	uint32_t f = f0;
++	unsigned waited = 0;
++	for (; waited < 1000 && f == f0; waited += 2) {
++		rc_sleep_ms(2);
++		f = rc_rd(rc_csis, 0x100);
++	}
++	if (f != f0) {
++		/* the DMA cycles ADDR1-8: slot 0 out of the cycle from now, so the first frame stays (and the stream below is
++		 * short enough, ~150 ms, that even without this the pointer would not come back to ADDR1) */
++		rc_wr(rc_csis, 0x1010, RC_BUF + RC_SLOT);
++		printf("rcam: stage 5: FIRST FRAME after about %u ms (FRM_CNT_CH0 %u); DMA0 ADDR1 now slot 1 (%#x), active pointer %u\n",
++		    waited, f, rc_rd(rc_csis, 0x1010), (rc_rd(rc_csis, 0x1030) >> 2) & 7);
++	} else {
++		printf("rcam: stage 5: no frame counted in 1 s\n");
++	}
++	rc_csis_report("first");
++	rc_sleep_ms(150);
++	rc_csis_report("after 150 ms more");
++	uint32_t dma_bytes = rc_rd(rc_csis, 0x1040);
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	uint32_t f1 = rc_rd(rc_csis, 0x100);
++	printf("rcam: stage 5: %u frames counted in %llu ms; DMA0 active pointer %u (ADDR1 = slot 0 = the first frame)\n",
++	    f1 - f0, ns / 1000000, (rc_rd(rc_csis, 0x1030) >> 2) & 7);
++	if (!rc_o_keep) {
++		rc_stream_down();
++	} else {
++		printf("rcam: stage 5: kern.herolte_rcam_keep=1: still streaming (stage 0 stops it)\n");
++	}
++	rc_frame_stats("slot 0 (first frame)", rc_ring, fbytes, true);
++	rc_frame_stats("slot 1 (later frames)", rc_ring + RC_SLOT, fbytes, false);
++	rc_pic.dma_bytes = dma_bytes;
++	rc_pic.frames = f1 - f0;
++	rc_pic.mode = rc_w == 4032 ? 3 : 7;
++	printf("rcam: stage 5: frame export %s: %u bytes (kern.herolte_rcam_pic_info, kern.herolte_rcam_pic)\n",
++	    rc_pic.valid ? "ready" : "EMPTY", rc_pic.bytes);
++	printf("rcam: stage 5: the frame is at %#x (slot 0) and %#x (slot 1), %u x %u, 16 bits a pixel (RAW10 in 9:0)\n", RC_BUF,
++	    RC_BUF + RC_SLOT, rc_w, rc_h);
++	return f != f0;
++}
++
++/* ---- kern.herolte_rcam ---- */
++static int
++rc_run(int level)
++{
++	if (!rc_maps()) {
++		printf("rcam: map failed\n");
++		return ENXIO;
++	}
++	if (level == 0) {
++		rc_power_off();
++		rc_last = 0;
++		return 0;
++	}
++	for (int s = 1; s <= level; s++) {
++		bool ok = s == 1 ? rc_power_on() : s == 2 ? rc_probe() : s == 3 ? rc_firmware() : s == 4 ? rc_sensor_init() :
++		    rc_capture();
++		if (!ok) {
++			printf("rcam: stopped at stage %d (of %d); kern.herolte_rcam=0 powers everything down\n", s, level);
++			return EIO;
++		}
++		rc_last = s;
++	}
++	printf("rcam: stages 1-%d done\n", level);
++	return 0;
++}
++
++static int
++rc_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = rc_last;
++	int error = sysctl_handle_int(oidp, &value, 0, req);
++	if (error || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	if (!kauth_cred_issuser(kauth_cred_get())) {
++		return EPERM;
++	}
++	if (value < 0 || value > 5) {
++		return EINVAL;
++	}
++	printf("rcam: kern.herolte_rcam=%d by pid %d\n", value, proc_selfpid());
++	lck_mtx_lock(&rc_mtx);
++	error = rc_run(value);
++	lck_mtx_unlock(&rc_mtx);
++	return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, herolte_rcam, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    NULL, 0, rc_sysctl, "I", "rear camera IMX260 + C3: 0 off, 1 power, 2 I2C probe, 3 companion firmware, 4 sensor tables, 5 one frame");
++#endif /* ARM64_BOARD_CONFIG_HEROLTE */
