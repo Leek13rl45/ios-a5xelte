@@ -1,5 +1,34 @@
 # HEROLTE (Galaxy S7 SM-G930F, Exynos 8890): progreso
 
+## 2026-11-17: 0352 baseline recovered; 0353 building on ARM runner
+
+- The Intel job 43917355519 remained queued for over eleven minutes and
+  was cancelled. Same source e8dd573 is building in 43919249542 on macos-15
+  (ARM64), temporary branch rearcam-surface-use-builder. Compilation began
+  17:31:56 UTC; no new kernel has been installed yet. The private watcher
+  now targets that run and artifact xnu-kernel-macos-15.
+- diagnostics/surface-use-baseline/ was recovered read-only after automatic
+  recovery. The real IOSurface API test reproduces four failures: local
+  increment/nested counts work, but shared IsInUse remains false, including
+  while the second process holds a use. Initial/balanced/child-death checks
+  pass. This establishes the missing protocol, not its causal relation to
+  image corruption.
+- User exercised home scrolling and manually opened Weather. CPU snapshots
+  show substantial early diagnostic overhead: hero-oslog peaks near one
+  core and diagnosticd at 171%, while widget startup also consumes CPU.
+  The later samples settle substantially. These are top-eight process CPU
+  snapshots, not frame-time measurements, and do not establish the UI
+  stutter's sole cause. The next focused image trial disables both live log
+  streams to avoid repeating that observer load.
+- Actual Weather.app now appears in the recovered log. It misses forecast
+  caches, starts WDS requests, and begins JWT generation with the correct
+  bundle ID. A separate HTTP 200 response is 3376 bytes; no forecast decode
+  or JWT completion is established. Cloud No-account messages still do not
+  prove why native manual-city forecasts fail. KST remains correct.
+- The next bounded trial will compare the same existing HEIC original and
+  the shared-use API with herosuse=1. Photos are preserved. Untimed normal
+  handback and actual image/UI/Weather success remain outstanding.
+
 ## 2026-11-17: current-kernel UI/Weather baseline running during 0353 CI
 
 - 0353 CI 43917355519 at e8dd573 was submitted 17:20:35 UTC and is queued.
