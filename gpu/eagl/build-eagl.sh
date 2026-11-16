@@ -87,4 +87,4 @@ codesign -s - -f --entitlements "$HERE/test/hero-oslog.entitlements" "$OUT/hero-
 
 # Clock bootstrap/HTTPS checks plus an opt-in front RAW sample, alongside the logger.
 $CC -O2 -Wall -fobjc-arc -o "$OUT/hero-system-probe" "$HERE/test/hero-system-probe.m" -framework Foundation
-codesign -s - -f --entitlements "$HERE/test/hero-oslog.entitlements" "$OUT/hero-system-probe"
+codesign -s - -f --entitlements "$HERE/test/hero-system-probe.entitlements" "$OUT/hero-system-probe"

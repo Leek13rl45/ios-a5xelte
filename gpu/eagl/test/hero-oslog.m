@@ -73,6 +73,22 @@ event_process(id event)
 	return [NSString stringWithFormat:@"pid-%d", pid];
 }
 
+/* Live log proxies hide their accessors from respondsToSelector:. Use only
+ * known object-returning accessors, after the caller checked record type. */
+static id
+log_object(id object, NSString *name)
+{
+	SEL selector = NSSelectorFromString(name);
+	Method method = class_getInstanceMethod(object_getClass(object), selector);
+	char result[16] = { 0 };
+	if (!method)
+		return nil;
+	method_getReturnType(method, result, sizeof(result));
+	if (result[0] != '@')
+		return nil;
+	return ((id (*)(id, SEL))method_getImplementation(method))(object, selector);
+}
+
 static void
 call1(id target, NSString *selector, id argument)
 {
@@ -156,7 +172,7 @@ main(void)
 						printf("hero-oslog: the first: %.800s\n", [[event description] UTF8String]);
 					}
 					NSString *process = event_process(event);
-					NSString *message = call0(event, @"composedMessage") ?: call0(event, @"formatString");
+					NSString *message = log_object(event, @"formatString");
 					if (!message) {
 						message = [event description];
 					}
@@ -171,18 +187,18 @@ main(void)
 					if (samples++ < 8)
 						printf("hero-oslog: accessor sample %s: %.500s\n", process.UTF8String, message.UTF8String);
 					/* boot-chhaptic: the events give their format, not the composed message: the arguments after it */
-					NSArray *arguments = call0(event, @"formatArguments");
+					NSArray *arguments = log_object(event, @"formatArguments");
 					if ([arguments isKindOfClass:[NSArray class]] && arguments.count) {
 						NSMutableString *with = [NSMutableString stringWithString:message];
 						[with appendString:@" | args:"];
 						for (id a in arguments) {
-							id value = call0(a, @"objectRepresentation");
+							id value = log_object(a, @"objectRepresentation");
 							[with appendFormat:@" «%@»", value ?: a];
 						}
 						message = with;
 					}
 					NSString *low = message.lowercaseString;
-					BOOL hit = NO;
+					BOOL hit = [words containsObject:@"*"];
 					for (NSString *w in words) {
 						if ([low containsString:w]) {
 							hit = YES;
@@ -198,8 +214,8 @@ main(void)
 					if (!hit) {
 						return;
 					}
-					NSDate *date = call0(event, @"date");
-					NSString *subsystem = call0(event, @"subsystem");
+					NSDate *date = log_object(event, @"date");
+					NSString *subsystem = log_object(event, @"subsystem");
 					printf("hero-oslog: %s %s [%s] %.600s\n", date ? [clock stringFromDate:date].UTF8String : "-",
 					    process.UTF8String, subsystem ? subsystem.UTF8String : "", message.UTF8String);
 					shown++;

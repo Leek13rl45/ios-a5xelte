@@ -1109,23 +1109,51 @@ rcam_dump(void)
    info[len < sizeof(info) ? len : sizeof(info) - 1] = 0;
    const char *b = strstr(info, "\nbytes ");
    long want = b ? atol(b + 7) : 0;
-   unsigned char *frame = want > 0 ? malloc((size_t)want) : NULL;
+   /* autorun has a small per-process memory limit. A full 6 MiB allocation
+    * killed it before the 0348 frame reached disk; stream bounded chunks. */
+   const size_t chunk = 1024 * 1024; /* the kernel exports one MiB per sysctl */
+   unsigned char *frame = want > 0 && want <= 4032L * 3024 * 2 ? malloc(chunk) : NULL;
    long got = 0;
-   while (frame && got < want) {
+   int fd = frame ? open(DROP_DIR "rcam-frame.raw.part", O_WRONLY | O_CREAT | O_TRUNC, 0644) : -1;
+   int error = fd < 0 ? (frame ? errno : ENOMEM) : 0;
+   herodrm_log("hero-run: rear camera: dumping %ld bytes in %zu-byte chunks", want, chunk);
+   while (!error && got < want) {
       unsigned off = (unsigned)got;
       size_t n = (size_t)(want - got);
+      if (n > chunk)
+         n = chunk;
       if (sysctlbyname("kern.herolte_rcam_pic_off", NULL, NULL, &off, sizeof(off)) != 0 ||
-          sysctlbyname("kern.herolte_rcam_pic", frame + got, &n, NULL, 0) != 0 || n == 0)
+          sysctlbyname("kern.herolte_rcam_pic", frame, &n, NULL, 0) != 0 || n == 0) {
+         error = errno ? errno : EIO;
+         break;
+      }
+      size_t written = 0;
+      while (written < n) {
+         ssize_t count = write(fd, frame + written, n - written);
+         if (count < 0 && errno == EINTR)
+            continue;
+         if (count <= 0) {
+            error = count < 0 ? errno : EIO;
+            break;
+         }
+         written += (size_t)count;
+      }
+      if (error)
          break;
       got += (long)n;
    }
-   int ok = 0;
-   int fd = open(DROP_DIR "rcam-frame.raw", O_WRONLY | O_CREAT | O_TRUNC, 0644);
    if (fd >= 0) {
-      ok = got > 0 && write(fd, frame, (size_t)got) == got;
-      fsync(fd);
+      if (fsync(fd) && !error)
+         error = errno;
       close(fd);
    }
+   int ok = !error && got == want && want > 0;
+   if (ok && rename(DROP_DIR "rcam-frame.raw.part", DROP_DIR "rcam-frame.raw") != 0) {
+      error = errno;
+      ok = 0;
+   }
+   if (!ok)
+      unlink(DROP_DIR "rcam-frame.raw.part");
    FILE *t = fopen(DROP_DIR "rcam-frame.txt", "w");
    if (t) {
       fprintf(t, "%sfile_bytes %ld\n", info, ok ? got : 0L);
@@ -1134,8 +1162,9 @@ rcam_dump(void)
       fclose(t);
    }
    free(frame);
-   herodrm_log("hero-run: rear camera: frame dump %ld of %ld bytes: %s", got, want, ok && got == want ? "rcam-frame.raw" :
-       "INCOMPLETE");
+   sync();
+   herodrm_log("hero-run: rear camera: frame dump %ld of %ld bytes: %s (%s)", got, want,
+       ok ? "rcam-frame.raw" : "INCOMPLETE", error ? strerror(error) : "ok");
 }
 
 static void *

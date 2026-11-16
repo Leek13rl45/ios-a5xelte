@@ -1,5 +1,35 @@
 # HEROLTE (Galaxy S7 SM-G930F, Exynos 8890): progreso
 
+## 2026-11-16: 0348 frame received; bounded dump and unattended retry
+
+- Recovered 0348 console: C3 mode 7 readback agrees, DMA frame-end is
+  observed, five frames arrive without SOT/lost-FS/lost-FE/ECC/CRC/DMA errors,
+  and slot 0/1 each change all 6,096,384 expected bytes. This establishes
+  complete DMA reception, not yet a recovered or displayed photograph.
+- Immediately after stage 5, autorun is killed with reason namespace 1,
+  code 7 (JETSAM / per-process memory limit). No final dump message occurs;
+  the filesystem still holds the older 3,081,584-byte RAW. Stream the frame
+  through one 1 MiB buffer instead of allocating its full size; handle short
+  writes and EINTR, fsync, then rename the completed temporary file.
+- Late probe has an IPv4 address, UTC in 2026, and HTTP 200 for both Apple
+  connectivity and weather-data's root page with ordinary TLS validation.
+  This does not establish authenticated forecast service success. The user
+  still reports manual Seoul unavailable; location/GPS alone cannot explain
+  that symptom. The previous logger hit its 200-line cap on locationd.
+- The user clarified Camera opens with a black preview. Late front setup
+  had omitted the mediaserverd restart used by the normal cam.level=8 path.
+  The next opt-in probe restarts it after the RAW sample, briefly opens
+  Camera, then retries Weather after clock/network setup and weatherd restart.
+  Logging excludes locationd noise and retrieves typed object accessors only
+  for log-message records (0x400); runtime confirmation remains required.
+- Native runtime builds/signing pass. The existing 0348 kernel and working
+  Bluetooth ADT are reused with herotwrp=240 (plus its 12-second log delay).
+  The redundant a5fb_perf=1 argument is omitted to fit the boot-argument
+  buffer; its compiled default is still 1. This is an unattended diagnostic
+  BOOT, not the daily-use image. Private artifacts/backups: timed-0348/.
+- Initial timed-image installation stopped during upload after verified
+  old BOOT/drop backups, before either partition write; USB went offline.
+
 ## 2026-11-16: Weather transport and front-color evidence, next trial ready
 
 - The system probe reports UTC `1970-01-01T00:00:55Z` at start. Both public

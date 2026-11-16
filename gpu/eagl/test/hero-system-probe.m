@@ -5,6 +5,7 @@
 #include <spawn.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
 #include <netdb.h>
@@ -16,10 +17,54 @@
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <signal.h>
+#include <objc/message.h>
 #include <unistd.h>
 #include "../../camera/hakios.camera.h"
 
 extern char **environ;
+
+static void
+restart_process(const char *name)
+{
+	int mib[] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL };
+	size_t size = 0;
+	if (sysctl(mib, 3, NULL, &size, NULL, 0))
+		return;
+	struct kinfo_proc *processes = malloc(size);
+	int killed = 0;
+	if (processes && !sysctl(mib, 3, processes, &size, NULL, 0))
+		for (size_t i = 0; i < size / sizeof(*processes); i++)
+			if (!strcmp(processes[i].kp_proc.p_comm, name))
+				killed += kill(processes[i].kp_proc.p_pid, SIGKILL) == 0;
+	free(processes);
+	printf("hero-system-probe: restart %s: %d\n", name, killed);
+}
+
+static void
+open_application(NSString *bundle)
+{
+	dlopen("/System/Library/Frameworks/CoreServices.framework/CoreServices", RTLD_NOW);
+	Class cls = NSClassFromString(@"LSApplicationWorkspace");
+	SEL workspaceSelector = NSSelectorFromString(@"defaultWorkspace");
+	id workspace = [cls respondsToSelector:workspaceSelector] ?
+	    ((id (*)(id, SEL))objc_msgSend)(cls, workspaceSelector) : nil;
+	SEL open = NSSelectorFromString(@"openApplicationWithBundleID:");
+	BOOL ok = [workspace respondsToSelector:open] &&
+	    ((BOOL (*)(id, SEL, id))objc_msgSend)(workspace, open, bundle);
+	printf("hero-system-probe: open %s %s\n", bundle.UTF8String, ok ? "accepted" : "unavailable");
+}
+
+static void
+open_weather(void)
+{
+	if (!getenv("HERO_PROBE_WEATHER"))
+		return;
+	/* Retry after network/clock bootstrap, clearing the daemon's early-boot
+	 * request state. The user's saved cities and settings stay intact. */
+	restart_process("weatherd");
+	open_application(@"com.apple.weather");
+}
 
 static void
 network_state(void)
@@ -167,6 +212,12 @@ front_sample(void)
 		free(buffer);
 	}
 	close(device);
+	restart_process("mediaserverd");
+	if (getenv("HERO_PROBE_CAMERA")) {
+		sleep(8);
+		open_application(@"com.apple.camera");
+		sleep(15);
+	}
 }
 
 static void
@@ -231,11 +282,13 @@ main(void)
 		printf("hero-system-probe: late UTC %s\n", [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]].UTF8String);
 		check_url(@"https://www.apple.com/library/test/success.html");
 		check_url(@"https://weather-data.apple.com/");
+		open_weather();
 		if (error == 0) {
 			int status = 0;
 			waitpid(logger, &status, 0);
 			printf("hero-system-probe: logger status %#x\n", status);
 		}
+		sync();
 	}
 	return 0;
 }
