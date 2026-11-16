@@ -34,10 +34,12 @@
   `cam.level=0` and `cam.media=0` temporarily disable the front-camera path to
   avoid concurrent use of shared resources. Prior drop entries, including
   Wi-Fi configuration, are retained; runtimes are updated to the completed CI.
-- Reboot issued at 19:27:47 KST. Next: get the user's screen/Bluetooth result,
-  return to TWRP for the persistent console and any `rcam-frame.raw`/`.txt`,
-  and decide the next camera stage from actual logs. No rear-camera capture
-  or Bluetooth runtime success has been observed yet. Private backups,
+- Reboot issued at 19:27:47 KST. The user subsequently reports Bluetooth now
+  works (in the context of the previously stuck enable/loading state).
+  Pairing, BLE discovery and data transfer have not been separately verified.
+  Next: return to TWRP for the persistent console and any
+  `rcam-frame.raw`/`.txt`, and decide the next camera stage from actual logs.
+  No rear-camera capture has been observed yet. Private backups,
   firmware, plist copies and install receipt are under `s7-port-work`, outside Git.
 
 Registrar por separado: compilación, marcadores recuperados, lo que se ve en
