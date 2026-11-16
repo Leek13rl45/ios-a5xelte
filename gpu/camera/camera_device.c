@@ -1383,13 +1383,14 @@ af_frame(int device, struct af *af, const struct hakios_camera_frame *f, const u
 static void
 load_tuning(struct isp *isp, uint32_t sensor)
 {
-	static const char *const names[] = { "ov02b10", "s5khm2sd", "ov16a1q", "s5k4h7" };
+	static const char *const names[] = { "ov02b10", "imx260", "s5k4e6", "s5k4h7" };
 	char path[96];
 
 	if (sensor >= sizeof(names) / sizeof(names[0])) {
 		return;
 	}
-	snprintf(path, sizeof(path), "/redwood/fw/camera-%s.isp", names[sensor]);
+	snprintf(path, sizeof(path), sensor == 1 || sensor == 2 ?
+	    "/private/var/herolte/camera-%s.isp" : "/redwood/fw/camera-%s.isp", names[sensor]);
 	if (isp_load_tuning(isp, path)) {
 		say("the %s's colour tuning from %s: %u colour matrices' lights, %u lens shadings'", names[sensor], path,
 		    isp->tuning->ccm.lights, isp->tuning->lsc.lights);

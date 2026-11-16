@@ -1,5 +1,42 @@
 # HEROLTE (Galaxy S7 SM-G930F, Exynos 8890): progreso
 
+## 2026-11-16: Weather transport and front-color evidence, next trial ready
+
+- The system probe reports UTC `1970-01-01T00:00:55Z` at start. Both public
+  Apple HTTPS checks return `NSURLErrorDomain/-1009` (offline). Wi-Fi later
+  joins and exchanges data. These are early-boot observations; they do not
+  establish that Weather's later manual-city failure has one proven cause.
+  Next probe records interface addresses, retries after the front sample,
+  and bootstraps an unset clock from validated-origin SNTP replies, with a
+  fresh host UTC seed as the diagnostic fallback. Standard TLS validation
+  stays enabled. This is not a completed persistent hardware RTC driver.
+- PID fallback identifies `locationd`, but hero-oslog traps with SIGTRAP
+  after that sample. Next logger restores `respondsToSelector:` guards and
+  restricts message access to type `0x400`, retaining primitive type samples;
+  this is a diagnostic change pending runtime confirmation.
+- Front RAW recovered: 1304x980, packed RAW10, stride 1630, Bayer 1 (GRBG),
+  black 64. Two green sites have nearly equal means (~140 above black); the
+  other sites average ~80 and ~67. This is compatible with the declared
+  Bayer layout; a neutral scene alone cannot verify red/blue color accuracy.
+  The production ISP on this sample starts at WB R=1.075/B=1.109 and reaches
+  R=1.716/B=2.035 after 30 frames, settling at 1.751/2.089. Updated ISP seeds
+  the first valid measured estimate directly, then uses existing smoothing;
+  the same real-sample replay reaches 1.751/2.089 on its first frame. This
+  reduces initial green tint; full sensor color calibration is still absent.
+- Corrected the donor sensor-name/profile lookup to IMX260/S5K4E6 under
+  `/private/var/herolte/`; no fabricated color matrix or lens-shading profile
+  was added. Native iOS camera library builds and signs locally; strict
+  compile checks pass for both diagnostic tools. A neutral scene and real
+  colors in the app still need user verification.
+- 0348 CI run `43855092408` passed. Prepared BOOT SHA-256
+  `a77b136c8401e0f6d12eb76805eb9f2acf6f64ca4eb75b4e17e1a1fe9342914b`,
+  with working Bluetooth ADT/boot arguments retained. Combined drop includes
+  clock seed/retry probe, updated front library and `cam.media=1`; the front
+  is initialized only after the rear trial stops. Current USB disconnected
+  before installation. Await TWRP reconnection, verify existing BOOT/drop,
+  back up, install/read back both candidates and reboot. Private evidence:
+  `s7-port-work/diagnostics/weather-front-probe/`.
+
 ## 2026-11-16: 0347 receives data; full frame and color still unresolved
 
 - Device console after 0347: C3 stream enable ACKs and reads back `0x1`;

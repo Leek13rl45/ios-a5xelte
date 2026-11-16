@@ -350,8 +350,17 @@ isp_awb(struct isp *isp, const struct isp_stats *s)
 	/* Note FE: the 4E6's red and blue come out ~1/15 of green under a room's light (logs/camera/raw1): up to 16x */
 	r = r < 0.5f ? 0.5f : r > 16 ? 16 : r;
 	b = b < 0.5f ? 0.5f : b > 16 ? 16 : b;
-	isp->wb[0] = isp->wb[0] * 0.9f + r * 0.1f;
-	isp->wb[2] = isp->wb[2] * 0.9f + b * 0.1f;
+	/* Start from the first measured estimate instead of showing unbalanced
+	 * RAW for the ~30 frames needed to approach it from unity. Subsequent
+	 * changes retain the existing smoothing. No sensor calibration is guessed. */
+	if (!isp->awb_ready) {
+		isp->wb[0] = r;
+		isp->wb[2] = b;
+		isp->awb_ready = true;
+	} else {
+		isp->wb[0] = isp->wb[0] * 0.9f + r * 0.1f;
+		isp->wb[2] = isp->wb[2] * 0.9f + b * 0.1f;
+	}
 }
 
 /* the part of the sensor's cells the picture shows: its middle, in the picture's proportions, 1/zoom of it each way */

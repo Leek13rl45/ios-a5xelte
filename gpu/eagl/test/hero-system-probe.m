@@ -1,20 +1,100 @@
-/* Network/clock diagnostics alongside hero-oslog. Drop as test.
+/* Network/clock bootstrap and diagnostics alongside hero-oslog. Drop as test.
  * Optional HERO_PROBE_FRONT captures a local RAW after stopping the rear test.
  * No credentials, location requests, or TLS overrides. */
 #import <Foundation/Foundation.h>
 #include <spawn.h>
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
+#include <netdb.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sysctl.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include "../../camera/hakios.camera.h"
 
 extern char **environ;
+
+static void
+network_state(void)
+{
+	struct ifaddrs *list = NULL;
+	if (getifaddrs(&list))
+		return;
+	for (struct ifaddrs *i = list; i; i = i->ifa_next) {
+		if (!i->ifa_addr || (i->ifa_addr->sa_family != AF_INET && i->ifa_addr->sa_family != AF_INET6))
+			continue;
+		char address[NI_MAXHOST];
+		if (!getnameinfo(i->ifa_addr, i->ifa_addr->sa_len, address, sizeof(address), NULL, 0, NI_NUMERICHOST))
+			printf("hero-system-probe: interface %s flags %#x address %s\n", i->ifa_name, i->ifa_flags, address);
+	}
+	freeifaddrs(list);
+}
+
+static void
+bootstrap_clock(void)
+{
+	if (time(NULL) >= 1577836800)
+		return;
+	/* Prefer a real network clock. Validate server mode, synchronization,
+	 * stratum and echoed origin token before accepting a reply. */
+	struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_DGRAM }, *list = NULL;
+	if (getaddrinfo("time.apple.com", "123", &hints, &list) == 0) {
+		int tried = 0;
+		for (struct addrinfo *a = list; a && tried++ < 2; a = a->ai_next) {
+			int fd = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+			if (fd < 0)
+				continue;
+			struct timeval timeout = { .tv_sec = 3 };
+			setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+			unsigned char query[48] = { 0x23 }, reply[512];
+			arc4random_buf(query + 40, 8);
+			ssize_t n = -1;
+			if (connect(fd, a->ai_addr, a->ai_addrlen) == 0 && send(fd, query, sizeof(query), 0) == sizeof(query))
+				n = recv(fd, reply, sizeof(reply), 0);
+			close(fd);
+			if (n < 48 || (reply[0] & 7) != 4 || (reply[0] >> 6) == 3 || !reply[1] || reply[1] > 15 ||
+			    memcmp(reply + 24, query + 40, 8))
+				continue;
+			uint32_t seconds, fraction;
+			memcpy(&seconds, reply + 40, 4);
+			memcpy(&fraction, reply + 44, 4);
+			double epoch = (double)ntohl(seconds) - 2208988800.0 + (double)ntohl(fraction) / 4294967296.0;
+			if (epoch < 1577836800 || epoch > 2085978495)
+				continue;
+			struct timeval now = { .tv_sec = (time_t)epoch, .tv_usec = (suseconds_t)((epoch - (time_t)epoch) * 1e6) };
+			int result = settimeofday(&now, NULL);
+			printf("hero-system-probe: network clock %.0f set %s\n", epoch, result == 0 ? "OK" : strerror(errno));
+			if (!result) {
+				freeaddrinfo(list);
+				return;
+			}
+		}
+		freeaddrinfo(list);
+	}
+	/* A fresh host-generated UTC seed is a diagnostic fallback when network
+	 * time is not yet reachable. It is refreshed for each installation. */
+	FILE *f = fopen("/private/var/herolte/clock.seed", "r");
+	long long seed = 0;
+	if (f) {
+		if (fscanf(f, "%lld", &seed) != 1)
+			seed = 0;
+		fclose(f);
+	}
+	if (seed >= 1577836800 && seed < 2085978495) {
+		struct timespec uptime;
+		clock_gettime(CLOCK_MONOTONIC, &uptime);
+		struct timeval now = { .tv_sec = (time_t)seed + uptime.tv_sec };
+		int result = settimeofday(&now, NULL);
+		printf("hero-system-probe: host UTC seed %lld set %s\n", seed, result == 0 ? "OK" : strerror(errno));
+	}
+}
 
 static int
 save_sample(const char *path, const void *buffer, size_t size)
@@ -139,11 +219,18 @@ main(void)
 		printf("hero-system-probe: logger spawn %d\n", error);
 		/* Network is brought up independently during boot. Let it settle. */
 		sleep(15);
+		network_state();
+		bootstrap_clock();
 		check_url(@"https://www.apple.com/library/test/success.html");
 		check_url(@"https://weather-data.apple.com/");
 		/* An HTTP rejection from this unauthenticated endpoint still proves
 		 * DNS/TLS transport. It does not prove Weather's authenticated API works. */
 		front_sample();
+		network_state();
+		bootstrap_clock();
+		printf("hero-system-probe: late UTC %s\n", [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]].UTF8String);
+		check_url(@"https://www.apple.com/library/test/success.html");
+		check_url(@"https://weather-data.apple.com/");
 		if (error == 0) {
 			int status = 0;
 			waitpid(logger, &status, 0);

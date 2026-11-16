@@ -45,13 +45,10 @@ static id
 call0(id target, NSString *selector)
 {
 	SEL s = NSSelectorFromString(selector);
-	Method method = target ? class_getInstanceMethod(object_getClass(target), s) : NULL;
-	if (!method) {
+	if (![target respondsToSelector:s]) {
 		return nil;
 	}
-	/* OSLogEventProxy overrides respondsToSelector:. Its runtime method table
-	 * still exposes these object-valued accessors; do not filter them out. */
-	return ((id (*)(id, SEL))method_getImplementation(method))(target, s);
+	return ((id (*)(id, SEL))[target methodForSelector:s])(target, s);
 }
 
 static NSString *
@@ -134,6 +131,17 @@ main(void)
 					if (shown >= max) {
 						return;
 					}
+					/* Activity/state proxies do not necessarily support message
+					 * composition. Only log-message records (0x400) go through
+					 * those accessors. Retain a few primitive type observations. */
+					SEL typeSelector = NSSelectorFromString(@"type");
+					Method typeMethod = class_getInstanceMethod(object_getClass(event), typeSelector);
+					unsigned long long type = typeMethod ?
+					    ((unsigned long long (*)(id, SEL))method_getImplementation(typeMethod))(event, typeSelector) : 0;
+					if (seen <= 8)
+						printf("hero-oslog: record type %#llx\n", type);
+					if (type != 0x400)
+						return;
 					if (seen == 1) {
 						/* boot-oslog3: no event answered process or composedMessage: say what the events are */
 						unsigned n = 0;
