@@ -1405,11 +1405,14 @@ main(int main_argc, char **main_argv)
    }
    herodrm_log("hero-run: test started, pid %d", pid);
    int status = 0;
-   for (int i = 0; i < 1800; i++) {
+   int test_seconds = getenv("HERO_TEST_SECONDS") ? atoi(getenv("HERO_TEST_SECONDS")) : 180;
+   if (test_seconds < 1 || test_seconds > 600)
+      test_seconds = 180;
+   for (int i = 0; i < test_seconds * 10; i++) {
       if (waitpid(pid, &status, WNOHANG) == pid)
          break;
-      if (i == 1799) {
-         herodrm_log("hero-run: test still running after 180 s, killing it");
+      if (i == test_seconds * 10 - 1) {
+         herodrm_log("hero-run: test still running after %d s, killing it", test_seconds);
          kill(pid, SIGKILL);
          waitpid(pid, &status, 0);
       }

@@ -110,6 +110,7 @@ main(void)
 		BOOL compose = number("HERO_OSLOG_COMPOSED", 0) != 0;
 		/* boot-oslog2: 153581 events and none of mediaserverd's matched: every process now ("*"), with a count by process */
 		NSArray *procs = list("HERO_OSLOG_PROCS", "*");
+		NSArray *excluded = list("HERO_OSLOG_EXCLUDE", "");
 		NSArray *words = list("HERO_OSLOG_WORDS", "haptic,actuator,vibe,vibrat,systemsound,taptic,4810,hsp");
 		setvbuf(stdout, NULL, _IOLBF, 0);
 		printf("hero-oslog: following the live log for %d s; processes %s; words %s\n", seconds,
@@ -194,6 +195,9 @@ main(void)
 					    decoded ? [NSString stringWithFormat:@"%@ | %@", format ?: @"", decoded] : format;
 					if (!message)
 						message = [event description];
+					for (NSString *part in excluded)
+						if ([message rangeOfString:part options:NSCaseInsensitiveSearch].location != NSNotFound)
+							return;
 					/* Retain a few selected-process samples even when a missing
 					 * format database prevents keyword filtering. */
 					if (samples++ < 8)

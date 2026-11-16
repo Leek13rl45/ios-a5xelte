@@ -65,6 +65,15 @@ open_application(NSString *bundle)
 	SEL open = NSSelectorFromString(@"openApplicationWithBundleID:");
 	BOOL ok = [workspace respondsToSelector:open] &&
 	    ((BOOL (*)(id, SEL, id))objc_msgSend)(workspace, open, bundle);
+	if (!ok) {
+		void *sbs = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_LAZY);
+		int (*launch)(CFStringRef, Boolean) = sbs ? dlsym(sbs, "SBSLaunchApplicationWithIdentifier") : NULL;
+		if (launch) {
+			int result = launch((__bridge CFStringRef)bundle, false);
+			printf("hero-system-probe: SpringBoard launch %s result %d\n", bundle.UTF8String, result);
+			ok = result == 0;
+		}
+	}
 	printf("hero-system-probe: open %s %s (workspace %d)\n", bundle.UTF8String, ok ? "accepted" : "unavailable", workspace != nil);
 	return ok;
 }
@@ -86,7 +95,8 @@ start_detail_logger(const char *processes, const char *words, const char *path, 
 				environment[used++] = environ[i];
 		const char *settings[] = { duration, selected,
 		    filtered, "HERO_OSLOG_MAX=3000",
-		    "HERO_OSLOG_MAX_PROCESS=1500", "HERO_OSLOG_COMPOSED=1" };
+		    "HERO_OSLOG_MAX_PROCESS=1500", "HERO_OSLOG_COMPOSED=1",
+		    "HERO_OSLOG_EXCLUDE=Failed to start the workgroup,HALS_AHPPlugIn" };
 		for (unsigned i = 0; i < sizeof(settings)/sizeof(settings[0]); i++)
 			environment[used++] = (char *)settings[i];
 		posix_spawn_file_actions_t actions;
@@ -109,7 +119,7 @@ open_photo(void)
 		return;
 	start_detail_logger("Camera,mediaserverd,assetsd,photolibraryd,photoanalysisd",
 	    "error,fail,jpeg,heif,heic,encode,save,photo,stillimage",
-	    "/private/var/herolte/photo-compose.out", 150);
+	    "/private/var/herolte/photo-compose.out", 200);
 	/* App registration is still starting when this probe first runs. */
 	sleep(45);
 	restart_process("Camera");
@@ -518,11 +528,67 @@ check_url(NSString *address)
 	[session invalidateAndCancel];
 }
 
+/* Change only Camera's Live Photo preference, through the mobile user's
+ * CFPreferences service. Keep clock/device work in the privileged parent. */
+static int
+camera_live_off_child(void)
+{
+	CFStringRef domain = CFSTR("com.apple.camera"), key = CFSTR("CAMUserPreferenceDesiredIrisMode");
+	CFTypeRef before = CFPreferencesCopyAppValue(key, domain);
+	int off = 0;
+	CFNumberRef value = CFNumberCreate(NULL, kCFNumberIntType, &off);
+	CFPreferencesSetAppValue(key, value, domain);
+	Boolean synced = CFPreferencesAppSynchronize(domain);
+	CFTypeRef after = CFPreferencesCopyAppValue(key, domain);
+	printf("hero-system-probe: mobile Camera Live Photo preference %s -> %s, sync %d uid %u\n",
+	    before ? [(__bridge id)before description].UTF8String : "unset",
+	    after ? [(__bridge id)after description].UTF8String : "unset", synced, getuid());
+	if (before) CFRelease(before);
+	if (after) CFRelease(after);
+	CFRelease(value);
+	return synced ? 0 : 1;
+}
+
+static void
+configure_camera(void)
+{
+	if (!getenv("HERO_CAMERA_LIVE_PHOTO_OFF"))
+		return;
+	NSString *path = @"/private/var/mobile/Library/Preferences/com.apple.camera.plist";
+	NSString *backup = @"/private/var/herolte/camera-preferences-before.plist";
+	if (![[NSFileManager defaultManager] fileExistsAtPath:backup])
+		[[NSData dataWithContentsOfFile:path] writeToFile:backup atomically:YES];
+	pid_t child = fork();
+	if (!child) {
+		if (setgid(501) || setuid(501)) _exit(126);
+		execl("/private/var/herolte/test", "hero-system-probe", "--camera-live-off", NULL);
+		_exit(127);
+	}
+	if (child < 0) {
+		printf("hero-system-probe: Camera preference child failed: %s\n", strerror(errno));
+		return;
+	}
+	int status = 0;
+	for (unsigned waited = 0; waited < 100; waited++) {
+		if (waitpid(child, &status, WNOHANG) == child) {
+			printf("hero-system-probe: Camera preference child status %#x\n", status);
+			return;
+		}
+		usleep(100000);
+	}
+	kill(child, SIGKILL);
+	waitpid(child, &status, 0);
+	printf("hero-system-probe: Camera preference child timed out\n");
+}
+
 int
-main(void)
+main(int argc, char **argv)
 {
 	@autoreleasepool {
+		if (argc == 2 && !strcmp(argv[1], "--camera-live-off"))
+			return camera_live_off_child();
 		setvbuf(stdout, NULL, _IOLBF, 0);
+		configure_camera();
 		configure_timezone();
 		printf("hero-system-probe: epoch %.0f, UTC %s\n", [NSDate date].timeIntervalSince1970,
 		    [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]].UTF8String);

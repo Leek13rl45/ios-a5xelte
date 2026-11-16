@@ -1,5 +1,43 @@
 # HEROLTE (Galaxy S7 SM-G930F, Exynos 8890): progreso
 
+## 2026-11-17: save failure reaches Live Photo staging; ordinary-photo trial prepared
+
+- Photo2 returned to TWRP; recovered diagnostics/photo2-0351/. Camera open
+  still returned false with a valid LS workspace through all retries, so
+  the optional virtual shutter was NOT sent. A real user shutter request
+  is present: 4032x3024 StillImage delivered after 211 ms. User confirms
+  shutter responds but no photograph remains.
+- Primary log captures BWIrisStagingNode reporting insufficient video/audio
+  for the Live Photo, followed by Camera Live Photo processing errors and
+  `Persistence cannot continue due to a capture error`. There is also a
+  photo-encoder completion/error path; its numerical values are absent in
+  the primary format-string log. The isolated composed logger ended before
+  the user's late capture, so it does not decode that failure. Do not claim
+  that ordinary JPEG encoding already works or that Live Photo is the only
+  possible blocker.
+- Read-only storage inspection: Media/DCIM/PhotoData are mobile:mobile,
+  mode 0750; about 8104 MiB free. DCIM has no files and copied Photos.sqlite
+  plus WAL reports zero ZASSET rows. This is not a merely missing thumbnail.
+- Prepare the next trial with HERO_CAMERA_LIVE_PHOTO_OFF=1. The privileged
+  probe backs up the Camera plist, then executes a short separate child as
+  uid/gid 501. That child uses CFPreferences to set only
+  CAMUserPreferenceDesiredIrisMode=0 and synchronize, logging before/after.
+  Original host backup confirms value 1; other preferences stay intact.
+  Device application and ordinary-photo persistence still need testing.
+- Diagnostic app launch can additionally try SpringBoardServices when the
+  LS workspace call returns false. That fallback is not device-verified.
+  Extended logging is paired with opt-in HERO_TEST_SECONDS (1..600,
+  default 180), fixing the old parent watchdog killing a 195-second probe
+  at 180 seconds. Optional log exclusions drop the repeated audio workgroup
+  and HAL-property errors so camera/encoding errors retain quota.
+- Probe/logger build with -Wall -Wextra -Werror; autorun builds with warnings
+  enabled (the existing CommonCrypto MD5 deprecation is suppressed). Signed
+  binaries and all private scripts remain in rear-focus-0352/runtime/.
+  Upcoming timed trial uses 300-second recovery, 240-second primary logging,
+  200-second isolated camera logging, and a 300-second parent watchdog.
+- 0352 CI 43891195416 is packaging after the Build step; final CI conclusion
+  and actual AF hardware validation are still pending. No 0352 install yet.
+
 ## 2026-11-17: photo-only retry and 0352 CI
 
 - Photo-only 0351 returned automatically; diagnostics/photo-0351/ shows
