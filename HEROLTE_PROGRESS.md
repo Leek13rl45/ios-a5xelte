@@ -1,5 +1,48 @@
 # HEROLTE (Galaxy S7 SM-G930F, Exynos 8890): progreso
 
+## 2026-11-16: timed test recovered; KST correction ready, charging
+
+- Runtime commit d171c9e and timed 0348 BOOT were installed with backup,
+  upload checksums and readback checks. BOOT SHA-256
+  `5f3a6e73da1d5c2c846c00a3cb8c5e53cc6cbae9ce3a97ad17a2a0a5b5e9e835`;
+  drop SHA-256 `59ea6267d5a217ab06aa2f5e09edff20f921f458f706b66cebaabb52a2f0d2ba`.
+  Reboot requested at 21:16:25 KST; herotwrp logs its recovery request and
+  TWRP reconnects around 21:21. The timed BOOT remains installed.
+- The streamed rear dump succeeds: 6,096,384 bytes, matching metadata and
+  recovered file size. No autorun jetsam. This particular RAW is essentially
+  black level (min 61/max 166/mean 64.2); the stretched PNG shows noise, not
+  scene detail. Illumination/lens coverage is unknown, so usable photography
+  and Bayer color remain unverified. Private evidence: diagnostics/timed-0348/.
+- Camera launches and the front reads ~60 frames with measured WB about
+  R=1.72/B=2.13, but all delivered/refused counters stay zero. Restart alone
+  has not established a working app preview. Next instrumentation records
+  graph-running, output configuration/handler/enabled state; it never forces
+  delivery into an unstarted graph. The next probe closes any old Camera
+  process before reopening it after front setup.
+- Logger traps again (status 0x5), after a selected WeatherWidget format
+  string is printed; direct argument access is backed out. The guarded
+  argument/date/subsystem accessors are retained, with the working typed
+  formatString accessor. Automatic Weather open reports unavailable, though
+  Weather later executes; no forecast API failure is identified yet. Late
+  public HTTPS checks still succeed.
+- User reports wrong timezone. Read-only HFS inspection confirms the actual
+  localtime symlink points to `/var/db/timezone/zoneinfo/US/Pacific`; zoneinfo
+  points to `/usr/share/zoneinfo.default`. Prepared opt-in HERO_TIMEZONE=
+  Asia/Seoul changes only that link after validating Seoul's TZif data,
+  backs up its old target, resets timezone caches and posts the system
+  notification. UTC remains unchanged. This has compiled/signed but is
+  **not installed or verified on the phone**.
+- TWRP reports capacity 0%, Charging, voltage 3.697 V, current 134. Capacity
+  calibration is not established. The user agreed to charge in TWRP for
+  10-15 minutes and reconnect. Device is now absent; no more writes/reboots
+  during charging. Private next drop and install scripts: kst-next/. The
+  installer refreshes the host UTC seed immediately before upload, checks
+  current timed BOOT/drop identity, backs them up, writes only the authorized
+  drop zone, verifies readback and leaves BOOT unchanged. Next: connect,
+  inspect charge/USB, install the next drop and run another timed test; pull
+  the timezone/preview/Weather evidence. Restore the untimed 0348 BOOT before
+  handing back a daily-use system.
+
 ## 2026-11-16: 0348 frame received; bounded dump and unattended retry
 
 - Recovered 0348 console: C3 mode 7 readback agrees, DMA frame-end is

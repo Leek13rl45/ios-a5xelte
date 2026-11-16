@@ -1,5 +1,7 @@
 /* Network/clock bootstrap and diagnostics alongside hero-oslog. Drop as test.
- * Optional HERO_PROBE_FRONT captures a local RAW after stopping the rear test.
+ * Optional HERO_PROBE_FRONT captures a local RAW after stopping the rear test;
+ * HERO_PROBE_CAMERA / HERO_PROBE_WEATHER open those apps for diagnosis.
+ * HERO_TIMEZONE=Asia/Seoul opts into a persistent localtime-link correction.
  * No credentials, location requests, or TLS overrides. */
 #import <Foundation/Foundation.h>
 #include <spawn.h>
@@ -19,6 +21,7 @@
 #include <time.h>
 #include <signal.h>
 #include <objc/message.h>
+#include <notify.h>
 #include <unistd.h>
 #include "../../camera/hakios.camera.h"
 
@@ -162,6 +165,54 @@ save_sample(const char *path, const void *buffer, size_t size)
 }
 
 static void
+configure_timezone(void)
+{
+	const char *zone = getenv("HERO_TIMEZONE");
+	if (!zone || strcmp(zone, "Asia/Seoul"))
+		return;
+	/* The phone's current localtime link was US/Pacific. Change the system
+	 * timezone link, leaving Unix/UTC time untouched. Validate installed tzdata
+	 * and preserve the old link before the opt-in change. */
+	const char *path = "/private/var/db/timezone/localtime";
+	const char *target = "/var/db/timezone/zoneinfo/Asia/Seoul";
+	const char *temporary = "/private/var/db/timezone/localtime.herolte";
+	char signature[4], previous[1024];
+	int fd = open(target, O_RDONLY);
+	ssize_t n = fd >= 0 ? read(fd, signature, sizeof(signature)) : -1;
+	if (fd >= 0)
+		close(fd);
+	if (n != sizeof(signature) || memcmp(signature, "TZif", 4)) {
+		printf("hero-system-probe: timezone: Seoul tzdata unavailable; no change\n");
+		return;
+	}
+	n = readlink(path, previous, sizeof(previous) - 1);
+	if (n < 0) {
+		printf("hero-system-probe: timezone: cannot read current link: %s\n", strerror(errno));
+		return;
+	}
+	previous[n] = 0;
+	if (strcmp(previous, target)) {
+		if (save_sample("/private/var/herolte/timezone-before.txt", previous, (size_t)n)) {
+			printf("hero-system-probe: timezone: cannot back up current link\n");
+			return;
+		}
+		unlink(temporary);
+		if (symlink(target, temporary) || rename(temporary, path)) {
+			printf("hero-system-probe: timezone: link update failed: %s\n", strerror(errno));
+			unlink(temporary);
+			return;
+		}
+		sync();
+	}
+	tzset();
+	[NSTimeZone resetSystemTimeZone];
+	notify_post("com.apple.system.timezone");
+	NSTimeZone *system = NSTimeZone.systemTimeZone;
+	printf("hero-system-probe: timezone %s offset %ld seconds (previous %s)\n",
+	    system.name.UTF8String, (long)[system secondsFromGMT], previous);
+}
+
+static void
 front_sample(void)
 {
 	if (!getenv("HERO_PROBE_FRONT"))
@@ -215,6 +266,7 @@ front_sample(void)
 	restart_process("mediaserverd");
 	if (getenv("HERO_PROBE_CAMERA")) {
 		sleep(8);
+		restart_process("Camera");
 		open_application(@"com.apple.camera");
 		sleep(15);
 	}
@@ -262,6 +314,7 @@ main(void)
 {
 	@autoreleasepool {
 		setvbuf(stdout, NULL, _IOLBF, 0);
+		configure_timezone();
 		printf("hero-system-probe: epoch %.0f, UTC %s\n", [NSDate date].timeIntervalSince1970,
 		    [[NSISO8601DateFormatter new] stringFromDate:[NSDate date]].UTF8String);
 		char *args[] = { "/private/var/herolte/hero-oslog", NULL };

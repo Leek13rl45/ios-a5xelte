@@ -1516,6 +1516,12 @@ worker(void *context)
 		}
 		uint64_t t_isp = mach_absolute_time();
 		pthread_mutex_lock(&s->lock);
+		if (s->frames == 1 || s->frames == 60) {
+			say("preview state frame %llu: graph %d", (unsigned long long)s->frames, s->graph_running);
+			for (int i = 0; i < OUTPUTS; i++)
+				say("preview %s: config %d, handler %d, enabled %d", s->out[i].name,
+				    s->out[i].config != NULL, s->out[i].handler != NULL, s->out[i].enabled);
+		}
 		for (int i = 0; s->graph_running && i < OUTPUTS; i++) {
 			struct output *out = &s->out[i];
 

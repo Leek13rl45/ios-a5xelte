@@ -187,12 +187,15 @@ main(void)
 					if (samples++ < 8)
 						printf("hero-oslog: accessor sample %s: %.500s\n", process.UTF8String, message.UTF8String);
 					/* boot-chhaptic: the events give their format, not the composed message: the arguments after it */
-					NSArray *arguments = log_object(event, @"formatArguments");
+					/* A 0x400 record's formatString works, but direct argument
+					 * materialization still traps in LoggingSupport on this image.
+					 * Keep the guarded accessor until decoding is understood. */
+					NSArray *arguments = call0(event, @"formatArguments");
 					if ([arguments isKindOfClass:[NSArray class]] && arguments.count) {
 						NSMutableString *with = [NSMutableString stringWithString:message];
 						[with appendString:@" | args:"];
 						for (id a in arguments) {
-							id value = log_object(a, @"objectRepresentation");
+							id value = call0(a, @"objectRepresentation");
 							[with appendFormat:@" «%@»", value ?: a];
 						}
 						message = with;
@@ -214,8 +217,8 @@ main(void)
 					if (!hit) {
 						return;
 					}
-					NSDate *date = log_object(event, @"date");
-					NSString *subsystem = log_object(event, @"subsystem");
+					NSDate *date = call0(event, @"date");
+					NSString *subsystem = call0(event, @"subsystem");
 					printf("hero-oslog: %s %s [%s] %.600s\n", date ? [clock stringFromDate:date].UTF8String : "-",
 					    process.UTF8String, subsystem ? subsystem.UTF8String : "", message.UTF8String);
 					shown++;
