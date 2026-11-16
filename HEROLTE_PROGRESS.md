@@ -1,5 +1,45 @@
 # HEROLTE (Galaxy S7 SM-G930F, Exynos 8890): progreso
 
+## 2026-11-16: current SM-G930S installation follow-up
+
+- User reports the first iOS boot reached the home screen and touch works,
+  after `XNU MMU ON` and an extended Apple-logo screen. Bluetooth cannot be
+  enabled / keeps loading. BLE discovery and connections are not verified.
+- Host inspection of the payload used for that boot: its ADT lacks both
+  `/arm-io/bluetooth` and `/arm-io/isp`. The root-build tuning script at
+  `8c4ab4d430568b5067e53aef82d8c9caec33c034` does not rename the Bluetooth
+  launchd job, while `hero-run` still disables `com.apple.bluetoothd`.
+  These are configuration findings, not a device-log diagnosis yet.
+- Rear-camera commit `7a7c385`: kernel run `43844307826` and mesa-ios run
+  `43844312708` both succeeded. Downloaded kernel and runtime checksums pass.
+- First-boot console recovered in TWRP: BCM4359C0 responds to HCI, the phone's
+  Murata patch loads all 274 records without odd answers, and the UART bridge
+  is created. `bluetoothd` repeatedly exits with status 0; bridge counters stay
+  at zero bytes in either direction. This supports investigating the missing
+  device-tree service; it does not establish BLE scanning or connection.
+- Correction to the initial configuration suspicion: the recovered
+  `disabled.plist` does **not** disable `com.apple.bluetoothd`, despite
+  `hero-run` logging that it wrote its disabled list. The actual launchd job
+  still has its original label. Renaming it follows the earlier working port
+  configuration and avoids that old code's label, but is not proof that a
+  disabled job caused this boot's failure.
+- At 19:27 KST, backed up the full current BOOT and existing drop package,
+  then installed the new runtime/drop and BOOT; both readback SHA-256 hashes
+  matched before reboot. BOOT `8af24ca7…a7d101f` adds only the `bluetooth` and
+  `isp` ADT nodes using `add_bluetooth_isp`; other ADT bytes and boot arguments
+  are unchanged. The launchd Bluetooth job's key and label become
+  `com.herolte.bluetoothd`; all other job contents are preserved.
+- Rear-camera trial: mode 7 (default), `rcam.level=5`, `rcam.dump=1`, no
+  `rcam.keep`; firmware CRC verified. Kernel stages stop on a failed check.
+  `cam.level=0` and `cam.media=0` temporarily disable the front-camera path to
+  avoid concurrent use of shared resources. Prior drop entries, including
+  Wi-Fi configuration, are retained; runtimes are updated to the completed CI.
+- Reboot issued at 19:27:47 KST. Next: get the user's screen/Bluetooth result,
+  return to TWRP for the persistent console and any `rcam-frame.raw`/`.txt`,
+  and decide the next camera stage from actual logs. No rear-camera capture
+  or Bluetooth runtime success has been observed yet. Private backups,
+  firmware, plist copies and install receipt are under `s7-port-work`, outside Git.
+
 Registrar por separado: compilación, marcadores recuperados, lo que se ve en
 pantalla y comportamiento de iOS. Plan y mapa de hardware en
 `docs/herolte-bringup.md`.
