@@ -157,7 +157,7 @@ diff --git a/bsd/dev/herolte_rcam.c b/bsd/dev/herolte_rcam.c
 +static uint8_t *rc_copy;
 +static uint64_t rc_seq;
 +static uint32_t rc_frame_seen, rc_exp = 800, rc_gain = 32;
-+static uint32_t rc_bayer = 3; /* Samsung's IMX260 module declares SBGGR10; scene verification pending. */
++static uint32_t rc_bayer = 1; /* IMX260 CIS driver: GR_BG (generic module format is not authoritative). */
 +SYSCTL_UINT(_kern, OID_AUTO, herolte_rcam_bayer, CTLFLAG_RW | CTLFLAG_LOCKED, &rc_bayer, 0,
 +    "rear live camera Bayer order: 0 RGGB, 1 GRBG, 2 GBRG, 3 BGGR");
 +static int rc_device_api = 1;
@@ -183,14 +183,14 @@ diff --git a/bsd/dev/herolte_rcam.c b/bsd/dev/herolte_rcam.c
  SYSCTL_PROC(_kern, OID_AUTO, herolte_rcam_pic, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
      NULL, 0, rc_pic_sysctl, "S", "rear camera: the captured frame (slot 0, 16 bits a pixel), up to 1 MiB from _pic_off");
  
-+/* Sony analog gain is 1024/(1024-code); the device ABI uses linear gain /32.
++/* IMX260 analog gain is 512/(512-code); the device ABI uses linear gain /32.
 + * Fixed mode 7 has 1600 lines at the measured 30 fps. */
 +static int
 +rc_apply_exposure(uint32_t lines, uint32_t gain)
 +{
 +	lines = MIN(MAX(lines, 4u), 1584u);
 +	gain = MIN(MAX(gain, 32u), 512u);
-+	uint32_t code = 1024u - 32768u / gain;
++	uint32_t code = 512u - 16384u / gain;
 +	bool ok = rc_sensor_wr8(0x0104, 1);
 +	ok &= rc_sensor_wr8(0x0202, lines >> 8);
 +	ok &= rc_sensor_wr8(0x0203, lines & 0xff);
@@ -200,7 +200,7 @@ diff --git a/bsd/dev/herolte_rcam.c b/bsd/dev/herolte_rcam.c
 +	if (!ok)
 +		return EIO;
 +	rc_exp = lines;
-+	rc_gain = gain;
++	rc_gain = 16384u / (512u - code);
 +	return 0;
 +}
 +

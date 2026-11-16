@@ -22,6 +22,7 @@
 #include <signal.h>
 #include <objc/message.h>
 #include <notify.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include "../../camera/hakios.camera.h"
 
@@ -213,6 +214,70 @@ configure_timezone(void)
 }
 
 static void
+rear_sample(void)
+{
+	if (!getenv("HERO_PROBE_REAR"))
+		return;
+	int supported = 0;
+	size_t length = sizeof(supported);
+	if (sysctlbyname("kern.herolte_rcam_device", &supported, &length, NULL, 0) || supported != 1) {
+		printf("hero-system-probe: physical rear device API unavailable\n");
+		return;
+	}
+	int device = open(HAKIOS_CAMERA_DEVICE, O_RDWR);
+	struct hakios_camera_command select = { .command = HAKIOS_CAMERA_SENSOR, .a = 1, .b = ~0u };
+	struct hakios_camera_frame header = { 0 };
+	if (device < 0 || write(device, &select, sizeof(select)) != sizeof(select) ||
+	    read(device, &header, sizeof(header)) != sizeof(header) ||
+	    memcmp(header.magic, HAKIOS_CAMERA_MAGIC, 8) || header.header_bytes != sizeof(header) ||
+	    header.sensor != 1 || header.width != 2016 || header.height != 1512 || header.stride != 2520 ||
+	    header.format != 1 || header.bayer > 3) {
+		printf("hero-system-probe: rear initialization/header failed: %s, sensor %u %ux%u stride %u\n",
+		    strerror(errno), header.sensor, header.width, header.height, header.stride);
+		if (device >= 0)
+			close(device);
+		return;
+	}
+	/* File-backed storage avoids another full-frame anonymous allocation in
+	 * this diagnostic process. Only publish a complete, validated read. */
+	size_t size = header.header_bytes + (size_t)header.stride * header.height;
+	const char *part = "/private/var/herolte/rear-sample.rwframe.part";
+	int file = open(part, O_RDWR | O_CREAT | O_TRUNC, 0644), good = 0;
+	void *map = MAP_FAILED;
+	if (file >= 0 && !ftruncate(file, size))
+		map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, file, 0);
+	uint64_t previous = header.sequence;
+	if (map != MAP_FAILED) {
+		for (int i = 0; i < 12; i++) {
+			ssize_t n = read(device, map, size);
+			struct hakios_camera_frame *frame = map;
+			if (n != (ssize_t)size || memcmp(frame->magic, HAKIOS_CAMERA_MAGIC, 8) ||
+			    frame->header_bytes != sizeof(header) || frame->sensor != 1 ||
+			    frame->width != header.width || frame->height != header.height ||
+			    frame->stride != header.stride || frame->sequence <= previous) {
+				printf("hero-system-probe: rear frame %d invalid (%ld bytes): %s\n", i, (long)n, strerror(errno));
+				good = 0;
+				break;
+			}
+			previous = frame->sequence;
+			good++;
+		}
+		if (good && (msync(map, size, MS_SYNC) || fsync(file)))
+			good = 0;
+		munmap(map, size);
+	}
+	if (file >= 0)
+		close(file);
+	close(device);
+	if (good && rename(part, "/private/var/herolte/rear-sample.rwframe"))
+		good = 0;
+	if (!good)
+		unlink(part);
+	printf("hero-system-probe: physical rear %ux%u stride %u Bayer %u: %d complete reads, sequence %llu, save %s\n",
+	    header.width, header.height, header.stride, header.bayer, good, (unsigned long long)previous, good ? "OK" : "FAILED");
+}
+
+static void
 front_sample(void)
 {
 	if (!getenv("HERO_PROBE_FRONT"))
@@ -220,6 +285,12 @@ front_sample(void)
 	/* hero-run's rear-camera test starts at 45 s. This probe starts at 20 s;
 	 * wait until it has stopped, then restore its shared resources first. */
 	sleep(45);
+	if (getenv("HERO_PROBE_REAR")) {
+		restart_process("Camera");
+		restart_process("mediaserverd");
+		sleep(3);
+		rear_sample();
+	}
 	int off = 0, level = 7;
 	if (sysctlbyname("kern.herolte_rcam", NULL, NULL, &off, sizeof(off))) {
 		printf("hero-system-probe: rear power-down failed: %s; front sample skipped\n", strerror(errno));
@@ -232,6 +303,12 @@ front_sample(void)
 	int device = open(HAKIOS_CAMERA_DEVICE, O_RDWR);
 	if (device < 0) {
 		printf("hero-system-probe: front open: %s\n", strerror(errno));
+		return;
+	}
+	struct hakios_camera_command select = { .command = HAKIOS_CAMERA_SENSOR, .a = 2, .b = ~0u };
+	if (write(device, &select, sizeof(select)) != sizeof(select)) {
+		printf("hero-system-probe: front selection failed: %s\n", strerror(errno));
+		close(device);
 		return;
 	}
 	struct hakios_camera_frame header = { 0 };
@@ -268,7 +345,8 @@ front_sample(void)
 		sleep(8);
 		restart_process("Camera");
 		open_application(@"com.apple.camera");
-		sleep(15);
+		int seconds = getenv("HERO_PROBE_CAMERA_SECONDS") ? atoi(getenv("HERO_PROBE_CAMERA_SECONDS")) : 15;
+		sleep((unsigned)(seconds > 0 && seconds <= 45 ? seconds : 15));
 	}
 }
 

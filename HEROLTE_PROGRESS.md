@@ -31,13 +31,22 @@
   the existing reserved 36 MiB; stable snapshots are packed into the same
   120-byte header/MIPI RAW10 ABI. Group-held exposure and Sony gain conversion
   serve the app's AE commands. No rear autofocus or full color calibration.
-  BGGR follows Samsung's declared module format and still needs scene evidence.
+  The IMX260-specific CIS driver declares GR_BG (the generic module's BGGR
+  is not authoritative). Use Bayer 1; scene/color evidence remains required.
 - Root hero-run preloads the validated companion image before publishing the
   camera device. The camera library selects the physical source before its
   first read. Both edited kernel sources pass local cross-compilation, 0349
   applies to the current 0348 tree, and runtime builds pass (existing MD5
   deprecation warning only). Live ring/frame bounds and RAW10 packing checked.
   Full CI and device behavior are pending. User explicitly said to proceed.
+- During CI, verification against the phone's ISP control code and Samsung's
+  IMX260 CIS source identified the actual analog transfer function:
+  gain=512/(512-code), not the generic 1024-based Sony variant. Corrected
+  conversion and reported quantized gain; codes bounded 0..480. Reference:
+  exynos8895/android_kernel_samsung_universal8895, lineage-19.1,
+  fimc-is-cis-imx260.c functions sensor_imx260_cis_calc_again_code/permile and
+  cis->bayer_order. Earlier CI 43871557109 is superseded; no 0349 device
+  write has happened. The device remains in TWRP on timed 0348.
 
 ## 2026-11-16: timed test recovered; KST correction ready, charging
 
