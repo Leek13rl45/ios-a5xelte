@@ -1,5 +1,44 @@
 # HEROLTE (Galaxy S7 SM-G930F, Exynos 8890): progreso
 
+## 2026-11-16: 0349 rear works; 0350 front paired controls
+
+- Corrected CI 43872733594 passed. Installed/readback verified timed 0349
+  BOOT SHA-256 37b878392a2cbc51c26dc4da7c25bd067730f9315deef9b3ae1d94b91f01f019,
+  diagnostic drop 142e3faa9b7010139c9c9ff45149a8ce661ec309ce5b4d9c99f75e56d13055db,
+  reboot at 22:26:45 KST. Recovered evidence: diagnostics/rear-device-0349/.
+  User confirms real rear video with normal color. Kernel logs physical
+  IMX260 stream and 319 reads, with app frames delivered. This is distinct
+  from the previous one-shot RAW-only result.
+- Automatic rear RAW capture failed: after a valid rear header, another
+  reader switched the global device to front and the payload was 1,597,520
+  bytes. No rear-sample file was published. Do not call that 12-frame test
+  passed. Next diagnostic will suspend mediaserverd during exclusive RAW
+  samples, restore SENSOR=2 before closing rear, then resume/restart media.
+- User reports front color still incorrect and image out of focus. The
+  module's ACTUATOR_NAME_NOTHING confirms fixed focus. The moving-preview
+  cell path also discards spatial detail before scaling; full demosaic can
+  improve that software blur but cannot add a physical autofocus motor.
+- Found a concrete missing S5K4E6 requirement in Samsung's CIS source:
+  always set short exposure 0x0202 AND long 0x021e, and short analog gain
+  0x0204 AND long 0x0220, even outside WDR. The old port only wrote the short
+  pair. Front app WB rises from about 2.05/1.80 at unity gain to ~4.14/3.89
+  around 2x; unequal control paths can account for an exposure-dependent
+  color bias, but the corrected hardware result still needs verification.
+- 0350 mirrors both pairs under group hold and logs periodic readback. It
+  also tightens the rear kernel gain cap to Samsung's 8x (code 0x1c0). Local
+  object compilation and patch-application checks pass. Full CI is next.
+  Runtime AE additionally needs to respect the reported gain/frame limits
+  in its intermediate branches and tolerate register quantization; the
+  current equality check can stall after a rounded rear gain update.
+- Weather now reaches JWT generation, TLS and a network response with
+  fairplayd enabled; no completed forecast was established. Cloud store
+  migration/sync errors remain. Public HTTPS still succeeds, KST persists.
+  Keep this separate from the earlier disabled-service signature failure.
+- Phone is back in TWRP, still on timed 0349 and the diagnostic drop above.
+  Normal 0349 BOOT candidate SHA-256
+  84bad44a60cf56e49a7f6292687c60f9c2625bae96d76b4bb7e6a416a8e67a19
+  is prepared but not installed. User authorized continuing the camera work.
+
 ## 2026-11-16: KST verified, preview reaches app, physical rear bridge (0349)
 
 - User reconnected after charging: TWRP 8%, 3.841 V, Charging. Installed

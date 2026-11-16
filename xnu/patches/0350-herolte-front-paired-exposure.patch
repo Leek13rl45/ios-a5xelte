@@ -1,0 +1,65 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -2814,15 +2814,34 @@
+ 	return nc_s.top && nc_s.csis && nc_s.phy && nc_s.pmu && nc_s.mmu && nc_s.cam1 && nc_s.pins && nc_i2c && nc_frame;
+ }
+ 
++/* S5K4E6 CIS requires BOTH long/short controls even outside WDR mode.
++ * Updating only 0x0202/0x0204 leaves the second path at its reset values. */
+ static void
+ nc_set_exposure(uint32_t lines, uint32_t gain)
+ {
+-	nc_exp = MIN(MAX(lines, 4), 2036);
+-	nc_gain = MIN(MAX(gain, 0x20), 0x200);
+-	nc_sensor_write(0x35, 0x0104, 1, 8);
+-	nc_sensor_write(0x35, 0x0202, (uint16_t)nc_exp, 16);
+-	nc_sensor_write(0x35, 0x0204, (uint16_t)nc_gain, 16);
+-	nc_sensor_write(0x35, 0x0104, 0, 8);
++	uint32_t exposure = MIN(MAX(lines, 4u), 2036u), analog = MIN(MAX(gain, 0x20u), 0x200u);
++	bool ok = nc_sensor_write(0x35, 0x0104, 1, 8);
++	ok &= nc_sensor_write(0x35, 0x0202, (uint16_t)exposure, 16);
++	ok &= nc_sensor_write(0x35, 0x021e, (uint16_t)exposure, 16);
++	ok &= nc_sensor_write(0x35, 0x0204, (uint16_t)analog, 16);
++	ok &= nc_sensor_write(0x35, 0x0220, (uint16_t)analog, 16);
++	ok &= nc_sensor_write(0x35, 0x0104, 0, 8);
++	if (!ok) {
++		printf("NOTEFE CAM: paired exposure/gain NACK (lines %u gain %u)\n", exposure, analog);
++		return;
++	}
++	nc_exp = exposure;
++	nc_gain = analog;
++	static uint32_t changes;
++	if ((changes++ & 255) == 0) {
++		uint8_t se[2] = {0}, le[2] = {0}, sg[2] = {0}, lg[2] = {0};
++		bool readback = nc_sensor_read(0x35, 0x0202, se, 2);
++		readback &= nc_sensor_read(0x35, 0x021e, le, 2);
++		readback &= nc_sensor_read(0x35, 0x0204, sg, 2);
++		readback &= nc_sensor_read(0x35, 0x0220, lg, 2);
++		printf("NOTEFE CAM: paired controls readback %s: exposure %u/%u, gain %u/%u\n",
++		    readback ? "ok" : "NACK", se[0] << 8 | se[1], le[0] << 8 | le[1], sg[0] << 8 | sg[1], lg[0] << 8 | lg[1]);
++	}
+ }
+ 
+ static void nc_stream_down(void);
+diff --git a/bsd/dev/herolte_rcam.c b/bsd/dev/herolte_rcam.c
+--- a/bsd/dev/herolte_rcam.c
++++ b/bsd/dev/herolte_rcam.c
+@@ -1495,7 +1495,7 @@
+ rc_apply_exposure(uint32_t lines, uint32_t gain)
+ {
+ 	lines = MIN(MAX(lines, 4u), 1584u);
+-	gain = MIN(MAX(gain, 32u), 512u);
++	gain = MIN(MAX(gain, 32u), 256u);
+ 	uint32_t code = 512u - 16384u / gain;
+ 	bool ok = rc_sensor_wr8(0x0104, 1);
+ 	ok &= rc_sensor_wr8(0x0202, lines >> 8);
+@@ -1819,7 +1819,7 @@
+ 		.magic = "RWFRAME1", .header_bytes = sizeof(header), .width = 2016, .height = 1512,
+ 		.stride = 2520, .format = 1, .bayer = rc_bayer & 3, .black = 64,
+ 		.sequence = ++rc_seq, .time = mach_absolute_time(), .exposure_lines = rc_exp,
+-		.line_ns = 20833, .gain = rc_gain, .gain_unity = 32, .gain_max = 512,
++		.line_ns = 20833, .gain = rc_gain, .gain_unity = 32, .gain_max = 256,
+ 		.frame_lines = 1600, .frame_lines_min = 1600, .frame_lines_max = 1600, .margin = 16,
+ 		.sensor = 1, .focus = 0xffffffffu, .reserved = { slot, act, f, 0, 0 }
+ 	};
