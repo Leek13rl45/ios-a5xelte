@@ -1,5 +1,27 @@
 # HEROLTE (Galaxy S7 SM-G930F, Exynos 8890): progreso
 
+## 2026-11-17: user reports a saved photograph with broken display
+
+- User now clarifies that a newly captured photograph appears in Photos,
+  but opening it looks broken. Treat this as a physical user report of
+  persistence progress; the corresponding DCIM original and database row
+  have not yet been recovered/validated. Do not equate this with the older
+  zero-file snapshots, which preceded this report.
+- The mobile-launch drop installer DID finish successfully at 15:34:37 UTC,
+  retaining 0352 BOOT d1b2cef9... and readback-verifying drop
+  5ddd018ff798a01f6abed2af75fb6059f3165a0a287a34d607de090f135b66f2.
+  No subsequent reboot was issued by this agent before the user's update;
+  user currently reports iOS, while ADB shows no device. Await recovery
+  before further writes. User said to continue.
+- Priority is read-only extraction of at most three recent DCIM image
+  originals and Photos database/WAL, host decoding/comparison, and the
+  matching boot logs. Distinguish malformed/visually corrupt encoded output
+  from a phone-side HEIC decoder/Photos rendering fault before changing the
+  encoder or capture pipeline. Existing phone images must be preserved.
+- Current implementation already had wallpaper HEIC decode failures in a
+  different process. This is context only, not proof of the new photo's
+  failure mode. No photo-original decode has been inspected yet.
+
 ## 2026-11-17: 0352 motor/codec init verified; mobile launch retry ready
 
 - Timed 0352 returned automatically. diagnostics/rear-focus-0352/ confirms
