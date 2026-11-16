@@ -16,6 +16,7 @@
 #include <objc/runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 static NSArray<NSString *> *
@@ -44,10 +45,35 @@ static id
 call0(id target, NSString *selector)
 {
 	SEL s = NSSelectorFromString(selector);
-	if (![target respondsToSelector:s]) {
+	Method method = target ? class_getInstanceMethod(object_getClass(target), s) : NULL;
+	if (!method) {
 		return nil;
 	}
-	return ((id (*)(id, SEL))[target methodForSelector:s])(target, s);
+	/* OSLogEventProxy overrides respondsToSelector:. Its runtime method table
+	 * still exposes these object-valued accessors; do not filter them out. */
+	return ((id (*)(id, SEL))method_getImplementation(method))(target, s);
+}
+
+static NSString *
+event_process(id event)
+{
+	NSString *name = call0(event, @"process");
+	if (name.length)
+		return name;
+	NSString *path = call0(event, @"processImagePath");
+	if (path.length)
+		return path.lastPathComponent;
+	SEL selector = NSSelectorFromString(@"processIdentifier");
+	Method method = class_getInstanceMethod(object_getClass(event), selector);
+	if (!method)
+		return @"?";
+	pid_t pid = (pid_t)((unsigned int (*)(id, SEL))method_getImplementation(method))(event, selector);
+	int mib[] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, pid };
+	struct kinfo_proc info = { 0 };
+	size_t size = sizeof(info);
+	if (sysctl(mib, 4, &info, &size, NULL, 0) == 0 && size && info.kp_proc.p_comm[0])
+		return [NSString stringWithUTF8String:info.kp_proc.p_comm];
+	return [NSString stringWithFormat:@"pid-%d", pid];
 }
 
 static void
@@ -87,7 +113,7 @@ main(void)
 			printf("hero-oslog: no live local store\n");
 			return 1;
 		}
-		__block int seen = 0, shown = 0;
+		__block int seen = 0, shown = 0, samples = 0;
 		NSMutableDictionary<NSString *, NSNumber *> *counts = [NSMutableDictionary dictionary];
 		__block id stream = nil;
 		NSDateFormatter *clock = [[NSDateFormatter alloc] init];
@@ -121,17 +147,10 @@ main(void)
 						    class_getName(class_getSuperclass([event class])), names.UTF8String);
 						printf("hero-oslog: the first: %.800s\n", [[event description] UTF8String]);
 					}
-					NSString *process = call0(event, @"process");
-					if (!process) {
-						NSString *path = call0(event, @"processImagePath");
-						process = path.lastPathComponent;
-					}
+					NSString *process = event_process(event);
 					NSString *message = call0(event, @"composedMessage") ?: call0(event, @"formatString");
 					if (!message) {
 						message = [event description];
-					}
-					if (!process) {
-						process = @"?";
 					}
 					if (process) {
 						counts[process] = @([counts[process] intValue] + 1);
@@ -139,6 +158,10 @@ main(void)
 					if (!process || !message || (![procs containsObject:@"*"] && ![procs containsObject:process.lowercaseString])) {
 						return;
 					}
+					/* Retain a few selected-process samples even when a missing
+					 * format database prevents keyword filtering. */
+					if (samples++ < 8)
+						printf("hero-oslog: accessor sample %s: %.500s\n", process.UTF8String, message.UTF8String);
 					/* boot-chhaptic: the events give their format, not the composed message: the arguments after it */
 					NSArray *arguments = call0(event, @"formatArguments");
 					if ([arguments isKindOfClass:[NSArray class]] && arguments.count) {

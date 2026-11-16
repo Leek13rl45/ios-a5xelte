@@ -84,3 +84,7 @@ codesign -s - -f --entitlements "$HERE/test/hero-run.entitlements" "$OUT/hero-ru
 # hero-oslog (dropped as hero-run's test): iOS's own log, read from logd's store, into the kernel's log.
 $CC -O2 -Wall -fobjc-arc -o "$OUT/hero-oslog" "$HERE/test/hero-oslog.m" -framework Foundation
 codesign -s - -f --entitlements "$HERE/test/hero-oslog.entitlements" "$OUT/hero-oslog"
+
+# Read-only clock/HTTPS checks plus an opt-in front RAW sample, alongside the logger.
+$CC -O2 -Wall -fobjc-arc -o "$OUT/hero-system-probe" "$HERE/test/hero-system-probe.m" -framework Foundation
+codesign -s - -f --entitlements "$HERE/test/hero-oslog.entitlements" "$OUT/hero-system-probe"

@@ -28,6 +28,26 @@
   runs without a color matrix or lens shading. Actual S5K4E6 color correction
   and Bayer validity still need a neutral RAW sample; do not invent calibration
   values or claim this observation alone proves the cause of the tint.
+- 0348 CI run `43855092408` at `50035d9` is in progress. It builds only the
+  next kernel; no new rear-camera runtime result yet.
+- While that builds, locally compiled and ad-hoc signed the updated logger
+  and `hero-system-probe` with iPhoneOS clang (`-Wall -Wextra -Werror`, no
+  warnings). The logger now obtains object accessors from the runtime method
+  table and falls back from missing process strings to PID/sysctl names;
+  eight accessor samples are capped independently of filtered output.
+  Proxy accessor behavior remains to be verified on the device.
+- The system probe starts the logger, records UTC time, performs standard
+  ephemeral HTTPS requests to Apple's public connectivity page and the
+  unauthenticated Weather data host (an HTTP rejection is transport evidence,
+  not successful authenticated Weather access). With `HERO_PROBE_FRONT=1`,
+  it subsequently waits until after the rear trial, powers the rear down,
+  initializes the front, validates the frame header and writes an owner-only,
+  fsynced `front-sample.rwframe` before any color processing. No calibration
+  changes have been applied yet.
+- Diagnostic drop backup/readback hashes verified, BOOT remains 0347.
+  Reboot issued **20:10:04 KST**. User is asked to retry manual Seoul weather,
+  offer a neutral scene to the front camera if possible, and return to TWRP
+  after about three minutes. Next pull `test.out` and `front-sample.rwframe`.
 
 ## 2026-11-16: first rear-camera trial, missing C3 stream enable (0347)
 
