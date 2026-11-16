@@ -1,0 +1,74 @@
+Subject: [PATCH] herolte: align C3 mode with IMX260 and retain first DMA target
+
+The 0347 device trial receives five frames but exports only 3,081,584 of
+6,096,384 bytes with LOST_FE set. Its C3 setfile remains at mode zero while
+the sensor is in mode seven. The same ISP firmware used for 0347 maps
+IMX260 mode 7 to C3 mode 7 at 0x83058 -> 0x834f6, and mode 3 to 3 at
+0x83046 -> 0x830e6; C73C3_SetMode writes the selector at 0x83856-0x83862.
+Apply it through the existing mode-setfile command, log and gate on ACK.
+Keep the first DMA address unchanged during its in-flight frame and wait
+for DMA completion. Label incomplete sentinel-buffer coverage as PARTIAL.
+This is a new device trial; it does not establish full-frame correctness.
+
+diff --git a/bsd/dev/herolte_rcam.c b/bsd/dev/herolte_rcam.c
+--- a/bsd/dev/herolte_rcam.c
++++ b/bsd/dev/herolte_rcam.c
+@@ -1246,6 +1246,18 @@
+ 		printf("rcam: stage 4: some sensor writes were not acknowledged: stopped\n");
+ 		return false;
+ 	}
++	/* C73C3_SetMode writes its mode selector to 0x0042; for IMX260,
++	 * firmware 0x82fe2 maps sensor mode 7 to C3 mode 7 (mode 3 to 3).
++	 * The boot setfile selected mode 0, before the sensor's actual mode. */
++	unsigned comp_mode = rc_o_mode == 3 ? 3 : 7;
++	bool mode_ok = rc_comp_i2c_wr(0x0042, (uint16_t)comp_mode);
++	int mode_read = rc_comp_i2c_rd(0x0042);
++	mode_ok = mode_ok && mode_read == (int)comp_mode && rc_comp_i2c_wr(0x6802, 0x0001);
++	printf("rcam: stage 4: companion mode %u, 0x0042 readback %#x, apply 0x6802: %s\n",
++	    comp_mode, (unsigned)mode_read, mode_ok ? "ok" : "FAILED");
++	if (!mode_ok) {
++		return false;
++	}
+ 	rc_configured = true;
+ 	return true;
+ }
+@@ -1581,17 +1593,23 @@
+ 		f = rc_rd(rc_csis, 0x100);
+ 	}
+ 	if (f != f0) {
+-		/* the DMA cycles ADDR1-8: slot 0 out of the cycle from now, so the first frame stays (and the stream below is
+-		 * short enough, ~150 ms, that even without this the pointer would not come back to ADDR1) */
+-		rc_wr(rc_csis, 0x1010, RC_BUF + RC_SLOT);
+-		printf("rcam: stage 5: FIRST FRAME after about %u ms (FRM_CNT_CH0 %u); DMA0 ADDR1 now slot 1 (%#x), active pointer %u\n",
+-		    waited, f, rc_rd(rc_csis, 0x1010), (rc_rd(rc_csis, 0x1030) >> 2) & 7);
++		/* FRM_CNT counts frame starts. Keep ADDR1 unchanged while its DMA
++		 * is active and wait for completion before inspecting the buffer.
++		 * The observation below is shorter than the 8-address ring in each mode. */
++		unsigned ended = 0;
++		while (ended < 100 && !(rc_rd(rc_csis, 0x1c) & (1u << 8))) {
++			rc_sleep_ms(2);
++			ended += 2;
++		}
++		printf("rcam: stage 5: FIRST START after %u ms; DMA end %s after %u ms; ADDR1 retained %#x, active pointer %u\n",
++		    waited, rc_rd(rc_csis, 0x1c) & (1u << 8) ? "yes" : "NO", ended,
++		    rc_rd(rc_csis, 0x1010), (rc_rd(rc_csis, 0x1030) >> 2) & 7);
+ 	} else {
+ 		printf("rcam: stage 5: no frame counted in 1 s\n");
+ 	}
+ 	rc_csis_report("first");
+-	rc_sleep_ms(150);
+-	rc_csis_report("after 150 ms more");
++	rc_sleep_ms(rc_w == 4032 ? 40 : 100);
++	rc_csis_report("after bounded observation");
+ 	uint32_t dma_bytes = rc_rd(rc_csis, 0x1040);
+ 	uint64_t ns = 0;
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+@@ -1609,7 +1627,7 @@
+ 	rc_pic.frames = f1 - f0;
+ 	rc_pic.mode = rc_w == 4032 ? 3 : 7;
+ 	printf("rcam: stage 5: frame export %s: %u bytes (kern.herolte_rcam_pic_info, kern.herolte_rcam_pic)\n",
+-	    rc_pic.valid ? "ready" : "EMPTY", rc_pic.bytes);
++	    !rc_pic.valid ? "EMPTY" : rc_pic.changed == fbytes ? "complete" : "PARTIAL", rc_pic.bytes);
+ 	printf("rcam: stage 5: the frame is at %#x (slot 0) and %#x (slot 1), %u x %u, 16 bits a pixel (RAW10 in 9:0)\n", RC_BUF,
+ 	    RC_BUF + RC_SLOT, rc_w, rc_h);
+ 	return f != f0;

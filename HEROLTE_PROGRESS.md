@@ -1,5 +1,34 @@
 # HEROLTE (Galaxy S7 SM-G930F, Exynos 8890): progreso
 
+## 2026-11-16: 0347 receives data; full frame and color still unresolved
+
+- Device console after 0347: C3 stream enable ACKs and reads back `0x1`;
+  CSIS0 sees its first frame start after ~26 ms, then 5 starts in 188 ms.
+  DMA frame-end is observed, with LOST_FE set but no CRC/ECC or DMA error.
+  The saved RAW contains 3,081,584 of the expected 6,096,384 bytes; every
+  received 16-bit sample is within 0..1023. Host grayscale rendering shows
+  initial image content followed by repeated/corrupt patterns. This is
+  partial image data, not a complete photograph or working Camera-app rear
+  stream. Evidence: `s7-port-work/diagnostics/0347-weather-camera/` outside Git.
+- 0348 selects C3 mode 7 to match the sensor, using the firmware's IMX260
+  mapping and `0x0042` selector followed by the existing setfile apply command
+  `0x6802 = 1`. It retains ADDR1 during active DMA, waits for frame-end, bounds
+  subsequent observation for the eight-address ring in each sensor mode, and
+  labels incomplete buffer coverage PARTIAL. Apply check passes against
+  0346+0347; applied source equals the local compile source. Device trial pending.
+- Weather capture: `weatherd` launches and network traffic exists. However,
+  hero-oslog saw 197,116 events with every process identified as `?`; its
+  process filter therefore produced zero records. This is a diagnostic-tool
+  failure, not evidence that Weather made no requests. Work in progress:
+  runtime-method accessors plus PID-name fallback, and a read-only system
+  clock / public HTTPS probe alongside the logger.
+- User reports the earlier front-camera preview was green/magenta tinted.
+  The first-boot log identifies the active front frame as 1304x980 but the
+  donor library looks for OV16A1Q tuning under `/redwood/fw/`, finds none and
+  runs without a color matrix or lens shading. Actual S5K4E6 color correction
+  and Bayer validity still need a neutral RAW sample; do not invent calibration
+  values or claim this observation alone proves the cause of the tint.
+
 ## 2026-11-16: first rear-camera trial, missing C3 stream enable (0347)
 
 - Recovered console after the Bluetooth fix: bridge traffic reaches 14,524
