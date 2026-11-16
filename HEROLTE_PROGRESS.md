@@ -1,5 +1,24 @@
 # HEROLTE (Galaxy S7 SM-G930F, Exynos 8890): progreso
 
+## 2026-11-17: focused decode/Weather trial rebooted
+
+- Installed and readback-verified the SAME 0352 kernel/ADT with 360-second
+  recovery and no herobot. BOOT
+  8240411b811ae9fb39b9a397049f07d696af91424525a3674c2889fde991f5a0;
+  drop f7ac12c4f0dfdce2640b17e4564a976ec2a9471d4b0970bfeb804d6e1de4978e.
+  Reboot requested 2026-11-16 17:03:08 UTC (Nov 17 02:03:08 KST).
+- Runtime 2d5c425 requests two bounded bitmap decodes of IMG_0003 only,
+  retaining all original photographs. Baseline versus local software-decoder
+  registration are separate children with file-backed output. No decoder
+  hook has been injected into Photos or system services by this experiment.
+- Automatic Weather launch follows Wi-Fi wait and clock refresh; composed
+  logging includes all Weather/weatherd/Widget/fairplay messages for 140 sec.
+  Public-website probes are skipped here because they do not establish
+  actual forecast success and consume the observation window.
+- Read-only pull to diagnostics/heic-weather-0352/ is waiting for recovery.
+  Bitmap/Weather outcomes are pending; no successful display fix or weather
+  forecast is claimed. Normal untimed handback remains outstanding.
+
 ## 2026-11-17: three HEIC originals valid on host; phone display path isolated
 
 - Recovered TWRP after user replug and native ADB backend restart. Verified
