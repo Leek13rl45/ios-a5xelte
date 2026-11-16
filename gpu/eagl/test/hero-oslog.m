@@ -106,6 +106,12 @@ main(void)
 {
 	@autoreleasepool {
 		int seconds = number("HERO_OSLOG_SECONDS", 80), max = number("HERO_OSLOG_MAX", 300);
+		/* A normal boot can explicitly disable diagnostics without opening
+		 * a live log stream or starting its diagnosticd work. */
+		if (seconds <= 0 || max <= 0) {
+			printf("hero-oslog: disabled\n");
+			return 0;
+		}
 		int processMax = number("HERO_OSLOG_MAX_PROCESS", 0);
 		BOOL compose = number("HERO_OSLOG_COMPOSED", 0) != 0;
 		/* boot-oslog2: 153581 events and none of mediaserverd's matched: every process now ("*"), with a count by process */

@@ -19,7 +19,10 @@
   The later samples settle substantially. These are top-eight process CPU
   snapshots, not frame-time measurements, and do not establish the UI
   stutter's sole cause. The next focused image trial disables both live log
-  streams to avoid repeating that observer load.
+  streams to avoid repeating that observer load. hero-oslog now exits before
+  loading LoggingSupport when seconds or line budget is zero; the signed
+  helper compiles with warnings as errors. Normal handback will use that
+  disabled mode, retaining only clock/KST bootstrap.
 - Actual Weather.app now appears in the recovered log. It misses forecast
   caches, starts WDS requests, and begins JWT generation with the correct
   bundle ID. A separate HTTP 200 response is 3376 bytes; no forecast decode
