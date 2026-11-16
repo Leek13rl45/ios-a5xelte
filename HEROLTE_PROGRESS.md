@@ -1,5 +1,33 @@
 # HEROLTE (Galaxy S7 SM-G930F, Exynos 8890): progreso
 
+## 2026-11-17: 0352 CI passed; HEIC software encoder trial
+
+- CI 43891195416 at 29f209f passed, including the Cortex-A53 no-LSE check.
+  Download checksum verification and packaging produce timed BOOT
+  d1b2cef9efa2d7bd87301397377e39a66f18a337b9de9e9a3306f2140461da0b
+  and normal BOOT
+  2997430ab07ca424d31c6f8719f26fcd6cfc14d06b2622d994e2212eed2f09c5
+  (18,907,152 bytes). Working BT/ISP ADT is unchanged. The timed cmdline
+  enables root-gated synthetic input and returns after 300 seconds.
+- Comparing the primary S9 port source exposes another missing still-photo
+  dependency: its camera registers Apple's installed VCPHEVC software
+  encoder with VideoToolbox because iPhone hardware HEVC encoders are absent.
+  Local libnotefecam had no such registration. Added an opt-in cam.soft-hevc
+  path, using only system codec/VT exports, guarded for missing symbols and
+  dictionary allocation. It logs registration status; no codec binaries are
+  committed. This does not itself prove a HEIC/photo can be saved on S7.
+- Source adapted from danstronics/ios-s9plus-exynos
+  core/userland/src/inject_media.c, register_hevc_encoder (MIT, existing
+  gpu/camera/LICENSE.HakiOS). Public primary source URL:
+  https://github.com/danstronics/ios-s9plus-exynos/blob/main/core/userland/src/inject_media.c
+  The private downloaded comparison file stays outside Git.
+- Camera library compiles cleanly with warnings enabled and is signed.
+  Upcoming 0352 drop combines software encoder registration, the mobile
+  CFPreferences Live Photo-off trial, extended log/watchdog bounds and
+  physical AK7371 support. Current installation is being checked against
+  the actual photo2 BOOT/drop before writes. Hardware AF, ordinary-photo
+  persistence and the SpringBoard launch fallback remain unverified.
+
 ## 2026-11-17: save failure reaches Live Photo staging; ordinary-photo trial prepared
 
 - Photo2 returned to TWRP; recovered diagnostics/photo2-0351/. Camera open

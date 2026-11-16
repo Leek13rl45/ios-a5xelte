@@ -10,6 +10,7 @@
  * iOS 16.5 (20F66) build; our image is not that build, so only the class and the method are checked here.
  * Loaded by libheroapp's constructor in mediaserverd only (gracerlte/heroapp/heroapp.c).
  */
+#include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <libkern/OSCacheControl.h>
@@ -427,6 +428,46 @@ tracer_start(void)
 	pthread_detach(t);
 }
 
+/* Opt-in software HEVC registration for HEIC still photos, adapted from
+ * danstronics/ios-s9plus-exynos core/userland/src/inject_media.c (MIT;
+ * LICENSE.HakiOS). The iPhone hardware encoder is absent on this device.
+ * Register only when the system codec and every required VT export exist;
+ * registration success alone does not prove an encoded/persisted photo. */
+static void
+register_hevc_encoder(void)
+{
+	if (access("/private/var/herolte/cam.soft-hevc", F_OK) != 0)
+		return;
+	void *codec = dlopen("/System/Library/VideoCodecs/VCPHEVC.videocodec", RTLD_NOW | RTLD_LOCAL);
+	void *vt = dlopen("/System/Library/Frameworks/VideoToolbox.framework/VideoToolbox", RTLD_NOW | RTLD_GLOBAL);
+	void *create = codec != NULL ? dlsym(codec, "HEVCVideoEncoder_CreateInstance") : NULL;
+	int (*register_encoder)(uint32_t, CFDictionaryRef, void *) = vt != NULL ? dlsym(vt, "VTRegisterVideoEncoderWithInfo") : NULL;
+	CFStringRef *id_key = vt != NULL ? dlsym(vt, "kVTVideoEncoderList_EncoderID") : NULL;
+	CFStringRef *name_key = vt != NULL ? dlsym(vt, "kVTVideoEncoderList_EncoderName") : NULL;
+	CFStringRef *hardware_key = vt != NULL ? dlsym(vt, "kVTVideoEncoderList_IsHardwareAccelerated") : NULL;
+	int status;
+
+	if (create == NULL || register_encoder == NULL || id_key == NULL || name_key == NULL || hardware_key == NULL ||
+	    !*id_key || !*name_key || !*hardware_key) {
+		say("mediaserverd: no software HEVC encoder to register (%s)\n", codec == NULL ? "no VCPHEVC.videocodec" :
+		    create == NULL ? "no HEVCVideoEncoder_CreateInstance" : "VideoToolbox without VTRegisterVideoEncoderWithInfo");
+		return;
+	}
+	const void *keys[] = { *id_key, *name_key, *hardware_key };
+	const void *values[] = { CFSTR("com.apple.videotoolbox.videoencoder.hevc.vcp"), CFSTR("HEVC (VCPHEVC, software)"),
+		kCFBooleanFalse };
+	CFDictionaryRef info = CFDictionaryCreate(NULL, keys, values, 3, &kCFTypeDictionaryKeyCallBacks,
+	    &kCFTypeDictionaryValueCallBacks);
+
+	if (!info) {
+		say("mediaserverd: software HEVC encoder dictionary allocation failed");
+		return;
+	}
+	status = register_encoder('hvc1', info, create);
+	CFRelease(info);
+	say("mediaserverd: the software HEVC encoder of VCPHEVC.videocodec registered for 'hvc1' (%d)\n", status);
+}
+
 __attribute__((constructor))
 static void
 notefe_camera_init(void)
@@ -440,6 +481,7 @@ notefe_camera_init(void)
 	say("mediaserverd: libnotefecam loaded; /dev/hakios-camera %s; shared cache slide %#lx (for symbolize.py)",
 	    access("/dev/hakios-camera", F_OK) == 0 ? "there" : "not there yet", cache ? (unsigned long)cache - 0x180000000ul : 0);
 	_dyld_register_func_for_add_image(image_added);
+	register_hevc_encoder();
 	tracer_start();
 
 }
