@@ -1,5 +1,33 @@
 # HEROLTE (Galaxy S7 SM-G930F, Exynos 8890): progreso
 
+## 2026-11-17: 0352 motor/codec init verified; mobile launch retry ready
+
+- Timed 0352 returned automatically. diagnostics/rear-focus-0352/ confirms
+  AK7371 ID 9, initial target 120/511 with readback OK; VCPHEVC software
+  encoder registration returns 0. Mobile CFPreferences child reports
+  1 -> 0, sync success, uid 501; recovered actual Camera plist has mode 0.
+  These are initialization/control results, not a verified focused image
+  or encoded/saved photograph.
+- No Camera shutter occurred in this boot. User could not inspect Camera or
+  rear focus. Root LS workspace still cannot open Camera; SpringBoardServices
+  returns 3. Automatic shutter therefore was NOT sent. Both scoped loggers
+  exit normally; Media/DCIM/PhotoData remain mobile-owned, 8099 MiB free,
+  no DCIM images and zero asset rows.
+- Actual /Applications/Camera.app/Info.plist confirms com.apple.camera.
+  Next diagnostic launches the app from a fresh uid/gid 501 process using
+  the same fork/exec pattern that successfully updated CFPreferences, while
+  retaining privileged clock/HID/device work in the parent. It is compiled
+  with warnings as errors and signed; actual launch is still unverified.
+- USB disappeared after evidence recovery. User confirmed TWRP and replugged;
+  recovered connection shows 39% / Charging. A first new install stopped on
+  BOOT backup validation before any write. Remote prefix SHA still matches
+  d1b2cef9..., and a complete 40 MiB retry at 4096-byte granularity matches
+  the current candidate and is backed up. Next script keeps BOOT unchanged
+  and changes only the diagnostic drop, after rechecking both predecessors.
+- Private next trial: rear-focus-0352/mobile/. The active installed profile
+  remains the original 0352 diagnostic drop until this next installer passes.
+  Untimed/normal handback remains outstanding.
+
 ## 2026-11-17: combined 0352 trial installed and reboot requested
 
 - Full BOOT/drop predecessor checks and backups completed against photo2.

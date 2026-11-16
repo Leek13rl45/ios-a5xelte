@@ -56,6 +56,31 @@ restart_process(const char *name)
 static BOOL
 open_application(NSString *bundle)
 {
+	if (getuid() == 0) {
+		/* LaunchServices has per-user application registration. Ask from a
+		 * fresh mobile-user process instead of root's application workspace. */
+		const char *identifier = bundle.UTF8String;
+		pid_t child = fork();
+		if (!child) {
+			if (setgid(501) || setuid(501)) _exit(126);
+			execl("/private/var/herolte/test", "hero-system-probe", "--open-app", identifier, NULL);
+			_exit(127);
+		}
+		if (child < 0)
+			return NO;
+		int status = 0;
+		for (unsigned waited = 0; waited < 100; waited++) {
+			if (waitpid(child, &status, WNOHANG) == child) {
+				printf("hero-system-probe: mobile launch %s child status %#x\n", identifier, status);
+				return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+			}
+			usleep(100000);
+		}
+		kill(child, SIGKILL);
+		waitpid(child, &status, 0);
+		printf("hero-system-probe: mobile launch %s timed out\n", identifier);
+		return NO;
+	}
 	dlopen("/System/Library/Frameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_LAZY);
 	dlopen("/System/Library/Frameworks/CoreServices.framework/CoreServices", RTLD_LAZY);
 	Class cls = NSClassFromString(@"LSApplicationWorkspace");
@@ -585,6 +610,8 @@ int
 main(int argc, char **argv)
 {
 	@autoreleasepool {
+		if (argc == 3 && !strcmp(argv[1], "--open-app"))
+			return open_application([NSString stringWithUTF8String:argv[2]]) ? 0 : 1;
 		if (argc == 2 && !strcmp(argv[1], "--camera-live-off"))
 			return camera_live_off_child();
 		setvbuf(stdout, NULL, _IOLBF, 0);
