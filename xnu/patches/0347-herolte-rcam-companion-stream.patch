@@ -12,6 +12,7 @@ Stop the companion along with the sensor. Fail stage 3 on a CRC mismatch.
 Firmware evidence is LLVM Thumb disassembly, not recovered source. Keep
 firmware and device captures outside Git. Runtime result remains untested.
 
+diff --git a/bsd/dev/herolte_rcam.c b/bsd/dev/herolte_rcam.c
 --- a/bsd/dev/herolte_rcam.c
 +++ b/bsd/dev/herolte_rcam.c
 @@ -1084,6 +1084,10 @@

@@ -25,10 +25,28 @@
   also refuses to start unverified firmware after a CRC mismatch. Patch apply
   check passes and the applied file equals the locally syntax-checked source
   (1 file, zero failed). Focused disassembly is retained outside Git.
-- Next: CI build 0347, install BOOT with the already working Bluetooth ADT,
-  retain the current drop/runtime, then inspect a fresh device log/frame.
-  The missing command is a concrete difference; runtime resolution remains
-  unproven until that trial.
+- CI run `43850578499` at source commit `9c7b064` passed (19:52:28 KST;
+  approximately 14 minutes including setup and compatibility checks). New
+  kernel checksum and the added stream-enable diagnostic string verified.
+- Installed BOOT `f79385a9…eca2913` with the already working Bluetooth ADT;
+  current BOOT and drop were backed up first, and both new readback hashes
+  matched. Reboot issued at **19:53:53 KST**. Camera mode 7 / level 5 remains
+  selected; sensor and companion stream-enable ACKs now gate capture.
+- User also reports current-location Weather data missing; manual-city
+  Weather and Maps were not checked. Samsung DTB declares a GPS device, but
+  no ported GNSS transport or CoreLocation integration was found (generic
+  HID GPS constants are not a driver). `locationd` starts; that alone does
+  not establish location fixes. TWRP's 2016 RTC is not proof of iOS's clock:
+  the iOS crash directory also contains current-date reports.
+- This trial drops the existing signed `hero-oslog` as the test, with a
+  165-second Weather/location/trust/network error filter (250 lines). Other
+  runtime/camera/Bluetooth entries are retained. User is asked to add Seoul
+  manually after the home screen, wait about 3 minutes, then return to TWRP
+  for `console.txt`, `test.out` and any raw frame. Actual cause of Weather
+  failure and rear-camera output after 0347 are still unproven.
+- Repository validation: 35 Python and 12 shell syntax checks pass. Four
+  pre-existing patch-number gaps remain. Standard diff header added to 0347;
+  its applied source is byte-identical to the CI-compiled implementation.
 
 ## 2026-11-16: current SM-G930S installation follow-up
 
