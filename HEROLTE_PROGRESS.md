@@ -1,5 +1,29 @@
 # HEROLTE (Galaxy S7 SM-G930F, Exynos 8890): progreso
 
+## 2026-11-16: native front trial booted; recovery evidence pending
+
+- CI 43885229677 at f877af3 passed. Verified artifact checksums and packaged
+  timed/native 0351 BOOT d4e95e30bd0d29430c72da5884eb480dd4fd8625f1a470d00be18bb680e313f3
+  and normal candidate a5bcc2289c60f1b26777cd6b31a951070ff4ba8623b1052b5e6212328f932311.
+  The timed image and diagnostic drop were installed with current-image
+  checks, full BOOT/drop backup and hash readback; reboot requested
+  2026-11-16 14:42:31 UTC (23:42:31 KST). This records the reboot request,
+  not a verified successful iOS boot or native camera stream yet.
+- Front probe uses file-backed capture storage for the 6,389,720-byte native
+  frame, avoiding the anonymous allocation that previously triggered jetsam
+  on large rear captures. Native input plus fast cell preview replaces the
+  slow 1304x980/full-detail combination for this test.
+- Stable Weather format-string logging remains primary. An opt-in separate
+  45-second process tries composed/decomposed messages only for Weather and
+  weatherd; it may trap independently without killing the system probe or
+  primary logger. It retains the default log privacy flags. This decoder
+  has compiled with warnings as errors but has not been verified on device.
+- User reports front blur across all shooting distances. Rear video/colors
+  were confirmed normal earlier; front focus/color and manual Weather remain
+  unresolved. Collect evidence from diagnostics/front-native-0351/ next.
+- Phone is on timed 0351 and still needs an untimed BOOT/normal profile
+  before daily-use handback. All private artifacts stay in s7-port-work/.
+
 ## 2026-11-16: 0350 controls verified; native front resolution trial (0351)
 
 - CI 43878704098 at ec1e4fe passed. Installed/readback verified timed 0350
@@ -12,8 +36,8 @@
   repeat gain 32 = 26.12/13.82/13.00/26.05. All sites scale together by
   ~1.98x. Front app WB stays near 2.02/1.88 around 2x analog gain instead
   of the old 4.14/3.89. User still reports abnormal front / lack of focus;
-  this is not a verified complete front-image fix. Distance clarification
-  (close versus arm's length) was asked and has not been answered yet.
+  this is not a verified complete front-image fix. User clarifies that the whole front image is blurry at every distance;
+  this does not establish a simple too-close shooting-distance explanation.
 - Exclusive sampling now succeeds: real rear 2016x1512, twelve complete
   reads through sequence 13, saved rear-sample.rwframe (3,810,360 bytes).
   Temporarily stopping media prevents its prewarm reader from switching the

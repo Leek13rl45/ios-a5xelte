@@ -27,6 +27,7 @@
 #include "../../camera/hakios.camera.h"
 
 extern char **environ;
+static pid_t weather_logger = -1;
 
 static int
 signal_process(const char *name, int signal)
@@ -71,6 +72,32 @@ open_weather(void)
 {
 	if (!getenv("HERO_PROBE_WEATHER"))
 		return;
+	if (getenv("HERO_WEATHER_COMPOSE")) {
+		/* Isolate private message decoding from the primary stable logger. */
+		size_t count = 0, used = 0;
+		while (environ[count]) count++;
+		char **environment = calloc(count + 8, sizeof(char *));
+		if (environment) {
+			for (size_t i = 0; i < count; i++)
+				if (strncmp(environ[i], "HERO_OSLOG_", 11))
+					environment[used++] = environ[i];
+			const char *settings[] = { "HERO_OSLOG_SECONDS=45", "HERO_OSLOG_PROCS=Weather,weatherd",
+			    "HERO_OSLOG_WORDS=error,fail,response,status", "HERO_OSLOG_MAX=600",
+			    "HERO_OSLOG_MAX_PROCESS=300", "HERO_OSLOG_COMPOSED=1" };
+			for (unsigned i = 0; i < sizeof(settings)/sizeof(settings[0]); i++)
+				environment[used++] = (char *)settings[i];
+			posix_spawn_file_actions_t actions;
+			posix_spawn_file_actions_init(&actions);
+			posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO,
+			    "/private/var/herolte/weather-compose.out", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+			posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO);
+			char *args[] = { "/private/var/herolte/hero-oslog", NULL };
+			int error = posix_spawn(&weather_logger, args[0], &actions, NULL, args, environment);
+			printf("hero-system-probe: separate Weather decoder spawn %d pid %d\n", error, weather_logger);
+			posix_spawn_file_actions_destroy(&actions);
+			free(environment);
+		}
+	}
 	/* Retry after network/clock bootstrap, clearing the daemon's early-boot
 	 * request state. The user's saved cities and settings stay intact. */
 	restart_process("weatherd");
@@ -333,8 +360,12 @@ front_capture(void)
 		return;
 	}
 	size_t size = header.header_bytes + (size_t)header.stride * header.height;
-	void *buffer = malloc(size);
-	if (buffer) {
+	const char *work = "/private/var/herolte/front-capture.work";
+	int storage = open(work, O_RDWR | O_CREAT | O_TRUNC, 0644);
+	void *buffer = MAP_FAILED;
+	if (storage >= 0 && !ftruncate(storage, size))
+		buffer = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, storage, 0);
+	if (buffer != MAP_FAILED) {
 		/* Preserve the kernel header plus packed RAW10, before color processing. */
 		int result = -1;
 		for (int i = 0; i < 5; i++) {
@@ -372,8 +403,11 @@ front_capture(void)
 			    .a = header.exposure_lines, .b = header.gain, .c = header.frame_lines };
 			(void)write(device, &restore, sizeof(restore));
 		}
-		free(buffer);
+		munmap(buffer, size);
 	}
+	if (storage >= 0)
+		close(storage);
+	unlink(work);
 	close(device);
 }
 
@@ -490,6 +524,11 @@ main(void)
 			int status = 0;
 			waitpid(logger, &status, 0);
 			printf("hero-system-probe: logger status %#x\n", status);
+		}
+		if (weather_logger > 0) {
+			int status = 0;
+			waitpid(weather_logger, &status, 0);
+			printf("hero-system-probe: separate Weather decoder status %#x\n", status);
 		}
 		sync();
 	}

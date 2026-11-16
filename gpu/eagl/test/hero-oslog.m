@@ -107,6 +107,7 @@ main(void)
 	@autoreleasepool {
 		int seconds = number("HERO_OSLOG_SECONDS", 80), max = number("HERO_OSLOG_MAX", 300);
 		int processMax = number("HERO_OSLOG_MAX_PROCESS", 0);
+		BOOL compose = number("HERO_OSLOG_COMPOSED", 0) != 0;
 		/* boot-oslog2: 153581 events and none of mediaserverd's matched: every process now ("*"), with a count by process */
 		NSArray *procs = list("HERO_OSLOG_PROCS", "*");
 		NSArray *words = list("HERO_OSLOG_WORDS", "haptic,actuator,vibe,vibrat,systemsound,taptic,4810,hsp");
@@ -175,18 +176,24 @@ main(void)
 						printf("hero-oslog: the first: %.800s\n", [[event description] UTF8String]);
 					}
 					NSString *process = event_process(event);
-					NSString *message = log_object(event, @"formatString");
-					if (!message) {
-						message = [event description];
-					}
 					if (process) {
 						counts[process] = @([counts[process] intValue] + 1);
 					}
-					if (!process || !message || (![procs containsObject:@"*"] && ![procs containsObject:process.lowercaseString])) {
+					if (!process || (![procs containsObject:@"*"] && ![procs containsObject:process.lowercaseString])) {
 						return;
 					}
 					if (processMax > 0 && [shownCounts[process] intValue] >= processMax)
 						return;
+					/* Experimental decoder runs in a separate short-lived process.
+					 * Never request sensitive/private logging flags. */
+					id decoded = compose ? log_object(event, @"composedMessage") : nil;
+					if (compose && !decoded)
+						decoded = log_object(event, @"decomposedMessage");
+					NSString *format = log_object(event, @"formatString");
+					NSString *message = [decoded isKindOfClass:NSString.class] ? decoded :
+					    decoded ? [NSString stringWithFormat:@"%@ | %@", format ?: @"", decoded] : format;
+					if (!message)
+						message = [event description];
 					/* Retain a few selected-process samples even when a missing
 					 * format database prevents keyword filtering. */
 					if (samples++ < 8)
