@@ -68,36 +68,58 @@ open_application(NSString *bundle)
 }
 
 static void
+start_detail_logger(const char *processes, const char *words, const char *path, int seconds)
+{
+	char selected[256], filtered[256], duration[64];
+	snprintf(selected, sizeof(selected), "HERO_OSLOG_PROCS=%s", processes);
+	snprintf(filtered, sizeof(filtered), "HERO_OSLOG_WORDS=%s", words);
+	snprintf(duration, sizeof(duration), "HERO_OSLOG_SECONDS=%d", seconds);
+	/* Isolate private message decoding from the primary stable logger. */
+	size_t count = 0, used = 0;
+	while (environ[count]) count++;
+	char **environment = calloc(count + 8, sizeof(char *));
+	if (environment) {
+		for (size_t i = 0; i < count; i++)
+			if (strncmp(environ[i], "HERO_OSLOG_", 11))
+				environment[used++] = environ[i];
+		const char *settings[] = { duration, selected,
+		    filtered, "HERO_OSLOG_MAX=3000",
+		    "HERO_OSLOG_MAX_PROCESS=1500", "HERO_OSLOG_COMPOSED=1" };
+		for (unsigned i = 0; i < sizeof(settings)/sizeof(settings[0]); i++)
+			environment[used++] = (char *)settings[i];
+		posix_spawn_file_actions_t actions;
+		posix_spawn_file_actions_init(&actions);
+		posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO,
+		    path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO);
+		char *args[] = { "/private/var/herolte/hero-oslog", NULL };
+		int error = posix_spawn(&weather_logger, args[0], &actions, NULL, args, environment);
+		printf("hero-system-probe: separate decoder spawn %d pid %d\n", error, weather_logger);
+		posix_spawn_file_actions_destroy(&actions);
+		free(environment);
+	}
+}
+
+static void
+open_photo(void)
+{
+	if (!getenv("HERO_PROBE_PHOTO"))
+		return;
+	start_detail_logger("Camera,mediaserverd,assetsd,photolibraryd,photoanalysisd",
+	    "error,fail,jpeg,heif,heic,encode,save,photo,stillimage",
+	    "/private/var/herolte/photo-compose.out", 170);
+	restart_process("Camera");
+	open_application(@"com.apple.camera");
+}
+
+static void
 open_weather(void)
 {
 	if (!getenv("HERO_PROBE_WEATHER"))
 		return;
-	if (getenv("HERO_WEATHER_COMPOSE")) {
-		/* Isolate private message decoding from the primary stable logger. */
-		size_t count = 0, used = 0;
-		while (environ[count]) count++;
-		char **environment = calloc(count + 8, sizeof(char *));
-		if (environment) {
-			for (size_t i = 0; i < count; i++)
-				if (strncmp(environ[i], "HERO_OSLOG_", 11))
-					environment[used++] = environ[i];
-			const char *settings[] = { "HERO_OSLOG_SECONDS=45", "HERO_OSLOG_PROCS=Weather,weatherd",
-			    "HERO_OSLOG_WORDS=error,fail,response,status", "HERO_OSLOG_MAX=600",
-			    "HERO_OSLOG_MAX_PROCESS=300", "HERO_OSLOG_COMPOSED=1" };
-			for (unsigned i = 0; i < sizeof(settings)/sizeof(settings[0]); i++)
-				environment[used++] = (char *)settings[i];
-			posix_spawn_file_actions_t actions;
-			posix_spawn_file_actions_init(&actions);
-			posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO,
-			    "/private/var/herolte/weather-compose.out", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-			posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO);
-			char *args[] = { "/private/var/herolte/hero-oslog", NULL };
-			int error = posix_spawn(&weather_logger, args[0], &actions, NULL, args, environment);
-			printf("hero-system-probe: separate Weather decoder spawn %d pid %d\n", error, weather_logger);
-			posix_spawn_file_actions_destroy(&actions);
-			free(environment);
-		}
-	}
+	if (getenv("HERO_WEATHER_COMPOSE"))
+		start_detail_logger("Weather,weatherd", "error,fail,response,status",
+		    "/private/var/herolte/weather-compose.out", 45);
 	/* Retry after network/clock bootstrap, clearing the daemon's early-boot
 	 * request state. The user's saved cities and settings stay intact. */
 	restart_process("weatherd");
@@ -491,6 +513,7 @@ main(void)
 		sleep(15);
 		network_state();
 		bootstrap_clock(NO);
+		open_photo();
 		check_url(@"https://www.apple.com/library/test/success.html");
 		check_url(@"https://weather-data.apple.com/");
 		/* An HTTP rejection from this unauthenticated endpoint still proves
@@ -528,7 +551,7 @@ main(void)
 		if (weather_logger > 0) {
 			int status = 0;
 			waitpid(weather_logger, &status, 0);
-			printf("hero-system-probe: separate Weather decoder status %#x\n", status);
+			printf("hero-system-probe: separate decoder status %#x\n", status);
 		}
 		sync();
 	}

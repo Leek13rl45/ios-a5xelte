@@ -1,0 +1,235 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -3123,6 +3123,8 @@
+ 				printf("NOTEFE CAM: device switched to physical %s sensor\n", c.a == 1 ? "rear" : "front");
+ 			}
+ 		}
++		if (c.command == 4)
++			error = nc_sensor_id == 1 ? herolte_rcam_dev_focus(c.a) : ENOTSUP;
+ 		if (c.command == 1) {
+ 			if (nc_sensor_id == 1) {
+ 				error = herolte_rcam_dev_exposure(c.a, c.b);
+diff --git a/bsd/dev/herolte_rcam.c b/bsd/dev/herolte_rcam.c
+--- a/bsd/dev/herolte_rcam.c
++++ b/bsd/dev/herolte_rcam.c
+@@ -58,6 +58,7 @@
+ #define RC_MAP_LEN      (2 * RC_SLOT)   /* slot 0: the first frame (DMA0 ADDR1), slot 1: the later ones (ADDR2-8) */
+ 
+ #define B_GPD1  0x40u
++#define B_GPD2  0x60u
+ #define B_GPC1  0x120u
+ #define B_GPC2  0x140u
+ #define B_GPC3  0x160u
+@@ -152,6 +153,8 @@
+ static const struct { uint32_t bank; uint8_t pin; const char *name; } rc_pinlist[] = {
+ 	{ B_GPC1, 0, "gpc1-0 sensor reset" }, { B_GPC1, 2, "gpc1-2 companion reset" },
+ 	{ B_GPK0, 0, "gpk0-0 MCLK0 (sensor)" }, { B_GPK0, 1, "gpk0-1 MCLK1 (companion)" },
++	{ B_GPD2, 2, "gpd2-2 AF AP SDA" }, { B_GPD2, 3, "gpd2-3 AF AP SCL" },
++	{ B_GPC2, 4, "gpc2-4 AF ISP SDA" }, { B_GPC2, 5, "gpc2-5 AF ISP SCL" },
+ 	{ B_GPC2, 0, "gpc2-0 I2C0 SDA" }, { B_GPC2, 1, "gpc2-1 I2C0 SCL" },
+ 	{ B_GPC3, 4, "gpc3-4 SPI1" }, { B_GPC3, 5, "gpc3-5 SPI1 SSN" }, { B_GPC3, 6, "gpc3-6 SPI1" }, { B_GPC3, 7, "gpc3-7 SPI1" },
+ };
+@@ -544,6 +547,142 @@
+ {
+ 	uint8_t v[2] = { (uint8_t)(val >> 8), (uint8_t)val };
+ 	return rc_i2c_write(RC_COMP, reg, v, 2);
++}
++
++/* AK7371: this phone's DT names product 12, 7-bit address 0x0c.
++ * AP access follows Samsung's on_i2c state: release ISP gpc2-4/5,
++ * use gpd2-2 SDA / gpd2-3 SCL. GPIO outputs only ever pull low.
++ * Existing rear power-up supplies the stock 2.8 V AF rail. */
++static bool rc_af_ready, rc_af_saved;
++static uint8_t rc_af_old_control;
++static uint16_t rc_af_position, rc_af_old_position;
++
++static bool
++rc_af_line(unsigned pin, bool release)
++{
++	rc_pin(B_GPD2, pin, release ? 0 : 1, -1, release ? -1 : 0);
++	delay(5);
++	if (pin == 3 && release) {
++		for (unsigned n = 0; n < 1000; n++) {
++			if (rc_rd(rc_pins, B_GPD2 + 4) & (1u << 3))
++				return true;
++			delay(1);
++		}
++		return false;
++	}
++	return true;
++}
++
++static bool
++rc_af_start(void)
++{
++	return rc_af_line(2, true) && rc_af_line(3, true) && rc_af_line(2, false) && rc_af_line(3, false);
++}
++
++static void
++rc_af_stop(void)
++{
++	(void)rc_af_line(2, false);
++	(void)rc_af_line(3, true);
++	(void)rc_af_line(2, true);
++}
++
++static bool
++rc_af_out(uint8_t byte)
++{
++	for (int bit = 7; bit >= 0; bit--)
++		if (!rc_af_line(2, (byte >> bit) & 1) || !rc_af_line(3, true) || !rc_af_line(3, false))
++			return false;
++	if (!rc_af_line(2, true) || !rc_af_line(3, true))
++		return false;
++	bool ack = !(rc_rd(rc_pins, B_GPD2 + 4) & (1u << 2));
++	(void)rc_af_line(3, false);
++	return ack;
++}
++
++static int
++rc_af_read(uint8_t reg)
++{
++	uint8_t value = 0;
++	bool ok = rc_af_start() && rc_af_out(0x18) && rc_af_out(reg) && rc_af_start() && rc_af_out(0x19);
++	for (unsigned bit = 0; ok && bit < 8; bit++) {
++		ok = rc_af_line(3, true);
++		value = (uint8_t)((value << 1) | ((rc_rd(rc_pins, B_GPD2 + 4) >> 2) & 1));
++		(void)rc_af_line(3, false);
++	}
++	/* Single-byte receive ends with NACK. */
++	if (ok)
++		ok = rc_af_line(2, true) && rc_af_line(3, true) && rc_af_line(3, false);
++	rc_af_stop();
++	return ok ? value : -1;
++}
++
++static bool
++rc_af_write(uint8_t reg, uint8_t value)
++{
++	bool ok = rc_af_start() && rc_af_out(0x18) && rc_af_out(reg) && rc_af_out(value);
++	rc_af_stop();
++	return ok;
++}
++
++static bool
++rc_af_set_position(uint16_t position)
++{
++	if (position > 511 || !rc_af_write(0, (uint8_t)(position >> 1)) ||
++	    !rc_af_write(1, (uint8_t)((position & 1) << 7)))
++		return false;
++	int high = rc_af_read(0), low = rc_af_read(1);
++	if (high < 0 || low < 0 || ((high << 1) | (low >> 7)) != position)
++		return false;
++	rc_af_position = position;
++	return true;
++}
++
++static void
++rc_af_initialize(void)
++{
++	rc_af_ready = rc_af_saved = false;
++	rc_pin(B_GPC2, 4, 0, 0, -1);
++	rc_pin(B_GPC2, 5, 0, 0, -1);
++	rc_pin(B_GPD2, 2, 0, 0, -1);
++	rc_pin(B_GPD2, 3, 0, 0, -1);
++	if ((rc_rd(rc_pins, B_GPD2 + 4) & 12) != 12) {
++		printf("rcam: AF: AP bus is not idle; no motor writes\n");
++		return;
++	}
++	int id = rc_af_read(3);
++	if (id != 9) {
++		printf("rcam: AF: AK7371 ID %d (expected 9); no motor writes\n", id);
++		return;
++	}
++	int control = rc_af_read(2), high = rc_af_read(0), low = rc_af_read(1);
++	if (control < 0 || high < 0 || low < 0)
++		return;
++	rc_af_old_control = (uint8_t)control;
++	rc_af_old_position = rc_af_position = (uint16_t)((high << 1) | (low >> 7));
++	rc_af_saved = true;
++	/* Samsung's default initial position, programmed before active mode. */
++	rc_af_ready = rc_af_set_position(120) && rc_af_write(2, 0) && rc_af_read(2) == 0;
++	delay(2000);
++	printf("rcam: AF: AK7371 ID 9, initial 120/511, readback %s\n", rc_af_ready ? "OK" : "FAILED");
++}
++
++static void
++rc_af_restore(void)
++{
++	if (rc_af_saved) {
++		/* Restore the previously found target in small steps, before its
++		 * original mode and power rails; never throw the lens end to end. */
++		for (unsigned i = 0; i < 22 && rc_af_position != rc_af_old_position; i++) {
++			uint16_t next = rc_af_position < rc_af_old_position ?
++			    MIN(rc_af_position + 24, rc_af_old_position) : MAX((int)rc_af_position - 24, rc_af_old_position);
++			if (!rc_af_set_position(next))
++				break;
++			delay(2000);
++		}
++		(void)rc_af_write(2, rc_af_old_control);
++	}
++	rc_af_ready = rc_af_saved = false;
+ }
+ 
+ /*
+@@ -940,6 +1079,7 @@
+ 		printf("rcam: stage 0: nothing powered by rcam\n");
+ 		return;
+ 	}
++	rc_af_restore();
+ 	rc_rail_restore(R_L12);                         /* VDDAF_2.8V_CAM off, 1000 */
+ 	delay(1000);
+ 	rc_pin(B_GPC1, 0, 1, -1, 0);                    /* "sen_rst" low */
+@@ -1730,6 +1870,7 @@
+ 	rc_seq = 0;
+ 	int error = rc_run(5);
+ 	if (!error) {
++		rc_af_initialize();
+ 		rc_frame_seen = rc_rd(rc_csis, 0x100);
+ 		printf("rcam: device: IMX260 live stream ready, 2016x1512\n");
+ 	} else {
+@@ -1761,6 +1902,24 @@
+ {
+ 	lck_mtx_lock(&rc_mtx);
+ 	int error = rc_live && rc_streaming ? rc_apply_exposure(lines, gain) : EIO;
++	lck_mtx_unlock(&rc_mtx);
++	return error;
++}
++
++int
++herolte_rcam_dev_focus(uint32_t target)
++{
++	lck_mtx_lock(&rc_mtx);
++	int error = 0;
++	if (!rc_live || !rc_streaming || !rc_af_ready)
++		error = ENOTSUP;
++	else if (target > 1023)
++		error = EINVAL;
++	else if (!rc_af_set_position((uint16_t)((target * 511u + 511) / 1023))) {
++		rc_af_ready = false;
++		error = EIO;
++		printf("rcam: AF: position readback failed; autofocus disabled\n");
++	}
+ 	lck_mtx_unlock(&rc_mtx);
+ 	return error;
+ }
+@@ -1821,7 +1980,7 @@
+ 		.sequence = ++rc_seq, .time = mach_absolute_time(), .exposure_lines = rc_exp,
+ 		.line_ns = 20833, .gain = rc_gain, .gain_unity = 32, .gain_max = 256,
+ 		.frame_lines = 1600, .frame_lines_min = 1600, .frame_lines_max = 1600, .margin = 16,
+-		.sensor = 1, .focus = 0xffffffffu, .reserved = { slot, act, f, 0, 0 }
++		.sensor = 1, .focus = rc_af_ready ? (rc_af_position * 1023u + 255) / 511 : 0xffffffffu, .reserved = { slot, act, f, 0, 0 }
+ 	};
+ 	error = uiomove((caddr_t)&header, (int)MIN(sizeof(header), (size_t)uio_resid(uio)), uio);
+ 	uint8_t line[2520];
+diff --git a/bsd/dev/herolte_camera.h b/bsd/dev/herolte_camera.h
+--- a/bsd/dev/herolte_camera.h
++++ b/bsd/dev/herolte_camera.h
+@@ -17,5 +17,6 @@
+ int herolte_rcam_dev_start(void);
+ void herolte_rcam_dev_stop(void);
+ int herolte_rcam_dev_read(struct uio *);
++int herolte_rcam_dev_focus(uint32_t);
+ int herolte_rcam_dev_exposure(uint32_t, uint32_t);
+ #endif

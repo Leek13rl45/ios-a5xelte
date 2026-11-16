@@ -1,5 +1,48 @@
 # HEROLTE (Galaxy S7 SM-G930F, Exynos 8890): progreso
 
+## 2026-11-16: native RAW recovered; photo saving and rear autofocus unresolved
+
+- Timed 0351 boot returned to TWRP automatically. Evidence recovered in
+  diagnostics/front-native-0351/. Native front stream is 2608x1960 with
+  all mode writes acknowledged; front RAW sample and gain-32 capture are
+  6,389,720 bytes. Later gain-64/repeat phases FAILED: the files at those
+  names are stale 1304x980 samples, not new native captures. Many native
+  reads were discarded as overwritten during snapshot (e.g. 40/86). Front
+  native mode is real but frame delivery/subject sharpness remain unverified.
+- Real rear twelve-frame sampling succeeds and Camera receives frames.
+  User now reports rear focus is also wrong. Current installed kernel still
+  reports NO_FOCUS and has no actuator control. Rear color/video success
+  never established working autofocus or still-photo saving.
+- User reports photos do not save. This boot has a StillImageCaptureNow
+  request and a 4032x3024 NV12 StillImage handed to the graph after 281 ms;
+  one photograph counted as delivered, zero output refusals. That is not
+  JPEG/HEIC encoding or Photos persistence evidence. DCIM has only .MISC.
+- Composed Weather decoder works for type-0x400 records with default privacy
+  flags. It exposes cloud-store No account / SyncedDefaults 8888 errors and
+  a 200 response of 3,377 bytes; no completed forecast/UI success established.
+  Network SNTP refresh and Asia/Seoul +32400 remain verified.
+- Installed a photo-only logging drop while retaining timed 0351 BOOT, with
+  full BOOT/drop backups and drop hash readback. Actual reboot requested
+  2026-11-16 14:52:17 UTC. No automatic RAW sampling, media suspension, or
+  mid-test app restart: Camera opens once, stable logging runs alongside an
+  isolated composed logger scoped to Camera/media/Photos services. User was
+  asked to try one photo. Evidence will be diagnostics/photo-0351/.
+- Prepared 0352 AK7371 actuator support. Actual phone DT selects product 12,
+  address 0x0c; Samsung enum maps 12 to AK7371. Samsung's on_i2c pins are AP
+  gpd2-2/3 with ISP gpc2-4/5 released. Stock pinctrl source confirms gpd2
+  offset 0x60. A strict ID=9 and original control/target reads precede any
+  motor write. Initial target 120, 9-bit position packing, active mode 0,
+  readback and 2 ms settling follow the Samsung driver. Focus commands map
+  the existing 0..1023 ABI to 0..511; unavailable/failed hardware leaves
+  NO_FOCUS, preserving preview. Saved targets/modes and pin fields restore
+  before the existing rear AF rail is restored. No new rail voltages.
+- Both affected kernel objects compile, and 0352 applies to 0351. Full CI
+  and hardware motor/focus validation are still pending. Do not report AF
+  working until actual ID/readback and physical focus behavior are observed.
+  Primary source: exynos8895/android_kernel_samsung_universal8895,
+  lineage-19.1, fimc-is-actuator-ak7371.c/.h; private copies remain off Git.
+- Normal untimed handback is still required; the phone is in a timed trial.
+
 ## 2026-11-16: native front trial booted; recovery evidence pending
 
 - CI 43885229677 at f877af3 passed. Verified artifact checksums and packaged
