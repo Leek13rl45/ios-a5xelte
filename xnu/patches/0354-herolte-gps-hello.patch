@@ -1,0 +1,257 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index cb7c523..c54d7ad 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -117,6 +117,7 @@ bsd/dev/sweet_net.c			standard
+ bsd/dev/sweet_apple80211.c		standard
+ bsd/dev/herolte_gl.c			standard
+ bsd/dev/herolte_rcam.c			standard
++bsd/dev/herolte_gps.c			standard
+ bsd/dev/a5xelte_keys.c			standard
+ bsd/dev/a5xelte_touch.c			standard
+ bsd/dev/sweet_sample.c			standard
+diff --git a/bsd/dev/herolte_gps.c b/bsd/dev/herolte_gps.c
+new file mode 100644
+index 0000000..bcb2fc0
+--- /dev/null
++++ b/bsd/dev/herolte_gps.c
+@@ -0,0 +1,225 @@
++/* HEROLTE hw9 BCM4773, firmware-independent bootstrap exchange.
++ * Run before audio configures the adjacent pins. Source: Samsung hw9 DT,
++ * bcm_gps_spi.c and lhd startup observed on this board in recovery. */
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <vm/memory_types.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, unsigned int);
++extern void ml_io_unmap(vm_offset_t, vm_size_t);
++void herolte_gps_probe(void);
++
++enum { CON = 0, DAT = 4, PUD = 8 };
++enum { CLK = 1U << 4, CS = 1U << 5, MISO = 1U << 6, MOSI = 1U << 7 };
++
++static uint32_t
++gps_read(vm_offset_t reg)
++{
++	uint32_t value = *(volatile uint32_t *)reg;
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return value;
++}
++
++static void
++gps_set(vm_offset_t reg, uint32_t mask, uint32_t value)
++{
++	*(volatile uint32_t *)reg = (gps_read(reg) & ~mask) | (value & mask);
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++struct gps_pins {
++	vm_offset_t bank;
++	uint32_t con_mask, dat_mask, pud_mask;
++	uint32_t con, dat, pud;
++};
++
++static void
++gps_configure(struct gps_pins *pins, unsigned con, unsigned dat, unsigned pud)
++{
++	pins->con = gps_read(pins->bank + CON);
++	pins->dat = gps_read(pins->bank + DAT);
++	pins->pud = gps_read(pins->bank + PUD);
++	gps_set(pins->bank + DAT, pins->dat_mask, dat);
++	gps_set(pins->bank + PUD, pins->pud_mask, pud);
++	gps_set(pins->bank + CON, pins->con_mask, con);
++}
++
++static void
++gps_restore(const struct gps_pins *pins)
++{
++	gps_set(pins->bank + CON, pins->con_mask, pins->con);
++	gps_set(pins->bank + DAT, pins->dat_mask, pins->dat);
++	gps_set(pins->bank + PUD, pins->pud_mask, pins->pud);
++}
++
++struct gps_bus {
++	vm_offset_t spi, req, resp, host;
++};
++
++/* Start with clock high. Mode 3 changes MOSI on falling and samples on rising.
++ * The ROM exchange fits in tiny frames, so polling GPIO avoids DMA and a
++ * shared SPI clock-tree reconfiguration during early bring-up. */
++static void
++gps_transfer(vm_offset_t spi, uint8_t *bytes, unsigned count)
++{
++	gps_set(spi, CS, 0);
++	delay(2);
++	for (unsigned i = 0; i < count; i++) {
++		uint8_t tx = bytes[i], rx = 0;
++		for (unsigned bit = 0; bit < 8; bit++) {
++			gps_set(spi, CLK | MOSI, (tx & 0x80) ? MOSI : 0);
++			delay(2);
++			gps_set(spi, CLK, CLK);
++			delay(2);
++			rx = (rx << 1) | !!(gps_read(spi) & MISO);
++			tx <<= 1;
++		}
++		bytes[i] = rx;
++	}
++	gps_set(spi, CS, CS);
++}
++
++static bool
++gps_wake(const struct gps_bus *bus)
++{
++	gps_set(bus->req, 1U << 4, 1U << 4);
++	for (unsigned i = 0; i < 100; i++) {
++		if (gps_read(bus->resp) & (1U << 2)) {
++			return true;
++		}
++		delay(1000);
++		if (i == 19 || i == 39 || i == 59) {
++			gps_set(bus->req, 1U << 4, 0);
++			delay(1000);
++			gps_set(bus->req, 1U << 4, 1U << 4);
++		}
++	}
++	gps_set(bus->req, 1U << 4, 0);
++	printf("HEROLTE GPS: MCU_RESP timeout\n");
++	return false;
++}
++
++static bool
++gps_send(const struct gps_bus *bus, uint8_t *frame, unsigned length)
++{
++	if (!gps_wake(bus)) {
++		return false;
++	}
++	gps_transfer(bus->spi, frame, length);
++	gps_set(bus->req, 1U << 4, 0);
++	return true;
++}
++
++static void
++gps_bootstrap(const struct gps_bus *bus)
++{
++	/* Byte zero in each write is the SSI half-duplex write command. */
++	uint8_t sync[37];
++	uint8_t query[] = {0, 0xb0,0,0,2,0x80,3,0,0,0,1,0xb1,0xb0,1};
++	static const uint8_t expected[] = {
++		0xb0,0,0,8,0xa0,0x14,1,0,1,1,0,0,0xff,0,0,0xff,0x19,0xb0,1
++	};
++	uint8_t header[] = { 0x20, 0 };
++	uint8_t payload[2 + sizeof(expected)] = { 0x20 };
++	sync[0] = 0;
++	memset(sync + 1, 0x80, 16);
++	if (!gps_send(bus, sync, 17)) {
++		return;
++	}
++	delay(110000);
++	sync[0] = 0;
++	memset(sync + 1, 0x80, 36);
++	if (!gps_send(bus, sync, sizeof(sync))) {
++		return;
++	}
++	delay(100000);
++	if (!gps_send(bus, query, sizeof(query))) {
++		return;
++	}
++	for (unsigned i = 0; !(gps_read(bus->host) & (1U << 4)); i++) {
++		if (i == 250) {
++			printf("HEROLTE GPS: HOST_REQ timeout after bootstrap query\n");
++			return;
++		}
++		delay(1000);
++	}
++	if (!gps_wake(bus)) {
++		return;
++	}
++	gps_transfer(bus->spi, header, sizeof(header));
++	if (header[0] == 0 && header[1] == sizeof(expected)) {
++		gps_transfer(bus->spi, payload, sizeof(payload));
++	}
++	gps_set(bus->req, 1U << 4, 0);
++	printf("HEROLTE GPS: SSI header %02x/%u payload header %02x/%u\n",
++	    header[0], header[1], payload[0], payload[1]);
++	if (payload[0] == 0 && payload[1] == sizeof(expected)) {
++		printf("HEROLTE GPS: bootstrap reply %s recovery reference\n",
++		    !memcmp(payload + 2, expected, sizeof(expected)) ? "matches" : "differs from");
++	}
++}
++
++void
++herolte_gps_probe(void)
++{
++	/* CMU_PERIC0/1, GPIO_PERIC0/1 and ALIVE. Only GPIO bus clocks needed. */
++	static const unsigned phys[] = {0x13610000,0x14c80000,0x136d0000,0x14cc0000,0x10580000};
++	vm_offset_t map[5];
++	unsigned count = 0;
++	int mode = 0;
++	if (!PE_parse_boot_argn("herogps", &mode, sizeof(mode)) || mode != 1) {
++		return;
++	}
++	for (; count < 5; count++) {
++		map[count] = ml_io_map_unmappable(phys[count], 0x1000, VM_WIMG_IO);
++		if (!map[count]) {
++			printf("HEROLTE GPS: MMIO map failed at %#x\n", phys[count]);
++			goto unmap;
++		}
++	}
++	/* Same PERIC0 GPIO gate used by audio/camera. Leave shared GPIO clocks
++	 * running for subsequent users. Read gates back before any GPIO loads. */
++	gps_set(map[0] + 0x800, 1U << 5, 1U << 5);
++	gps_set(map[1] + 0x800, 1U << 8, 1U << 8);
++	if (!(gps_read(map[0] + 0x800) & (1U << 5)) || !(gps_read(map[1] + 0x800) & (1U << 8))) {
++		printf("HEROLTE GPS: GPIO bus clock disabled\n");
++		goto unmap;
++	}
++	struct gps_pins power = { .bank = map[2]+0xa0, .con_mask = 0xf0, .dat_mask = 2, .pud_mask = 0xc };
++	struct gps_pins req = { .bank = map[3]+0x40, .con_mask = 0xf0000, .dat_mask = 16, .pud_mask = 0x300 };
++	struct gps_pins resp = { .bank = map[3]+0x140, .con_mask = 0xf00, .pud_mask = 0x30 };
++	struct gps_pins spi = { .bank = map[3]+0xa0, .con_mask = 0xffff0000, .dat_mask = CLK|CS|MOSI, .pud_mask = 0xff00 };
++	struct gps_pins host = { .bank = map[4]+0x60, .con_mask = 0xf0000, .pud_mask = 0x300 };
++	const struct gps_bus bus = {spi.bank+DAT, req.bank+DAT, resp.bank+DAT, host.bank+DAT};
++	if ((gps_read(power.bank + CON) & power.con_mask) == 0x10 && (gps_read(power.bank + DAT) & 2)) {
++		printf("HEROLTE GPS: standby already released, skip cold bootstrap\n");
++		goto unmap;
++	}
++	gps_configure(&host, 0, 0, 0x100);
++	gps_configure(&resp, 0, 0, 0x30);
++	gps_configure(&req, 0x10000, 0, 0);
++	gps_configure(&spi, 0x10110000, CS|CLK, 0xdf00);
++	gps_configure(&power, 0x10, 0, 0);
++	delay(21000);
++	gps_set(power.bank + DAT, 2, 2);
++	delay(31000);
++	printf("HEROLTE GPS: cold bootstrap power/req/resp/host=%u/%u/%u/%u\n",
++	    !!(gps_read(power.bank+DAT)&2), !!(gps_read(bus.req)&16),
++	    !!(gps_read(bus.resp)&4), !!(gps_read(bus.host)&16));
++	gps_bootstrap(&bus);
++	gps_set(power.bank + DAT, 2, 0);
++	gps_restore(&power);
++	gps_restore(&spi);
++	gps_restore(&req);
++	gps_restore(&resp);
++	gps_restore(&host);
++unmap:
++	while (count) {
++		ml_io_unmap(map[--count], 0x1000);
++	}
++}
++#endif
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 10449ab..380cb0e 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -778,6 +778,9 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 	/* sec_ts on the Exynos 8890 HSI2C (bsd/dev/herolte_touch.c). */
+ 	extern void herolte_touch_probe(void);
+ 	herolte_touch_probe();
++	/* Sample GPS before the audio worker starts using the adjacent GPE6 pin. */
++	extern void herolte_gps_probe(void);
++	herolte_gps_probe();
+ 	/* Mali-T880 read-only probe (bsd/dev/herolte_gpu.c). */
+ 	extern void herolte_gpu_probe(void);
+ 	herolte_gpu_probe();
