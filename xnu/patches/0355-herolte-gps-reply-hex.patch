@@ -1,0 +1,22 @@
+diff --git a/bsd/dev/herolte_gps.c b/bsd/dev/herolte_gps.c
+--- a/bsd/dev/herolte_gps.c
++++ b/bsd/dev/herolte_gps.c
+@@ -158,8 +158,18 @@
+ 	printf("HEROLTE GPS: SSI header %02x/%u payload header %02x/%u\n",
+ 	    header[0], header[1], payload[0], payload[1]);
+ 	if (payload[0] == 0 && payload[1] == sizeof(expected)) {
++		char got[2 * sizeof(expected) + 1], diff[2 * sizeof(expected) + 1];
++		static const char hex[] = "0123456789abcdef";
++		for (unsigned i = 0; i < sizeof(expected); i++) {
++			got[2 * i] = hex[payload[2 + i] >> 4];
++			got[2 * i + 1] = hex[payload[2 + i] & 15];
++			diff[2 * i] = diff[2 * i + 1] = payload[2 + i] == expected[i] ? '.' : '^';
++		}
++		got[sizeof(got) - 1] = diff[sizeof(diff) - 1] = 0;
+ 		printf("HEROLTE GPS: bootstrap reply %s recovery reference\n",
+ 		    !memcmp(payload + 2, expected, sizeof(expected)) ? "matches" : "differs from");
++		printf("HEROLTE GPS: reply %s\n", got);
++		printf("HEROLTE GPS: diff  %s\n", diff);
+ 	}
+ }
+ 
