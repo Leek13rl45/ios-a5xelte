@@ -158,6 +158,24 @@ jobs:
           path: buildtree.tgz
           retention-days: 7
 
+      - name: Package objects for local relinks
+        if: success()
+        run: |
+          # Objects, archives, export lists and link file lists: with these, a
+          # kernel change is a local recompile of the touched files plus a relink
+          # instead of a full CI build.
+          (cd dxb && find build/xnu.obj \( -name '*.o' -o -name '*.cpo' -o -name '*.a' \
+            -o -name '*.filelist' -o -name '*.exp' -o -name 'lastkernel*' \) -print) > objects.list
+          tar czf objects.tgz -C dxb -T objects.list
+          ls -la objects.tgz
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: xnu-objects-${{ matrix.runner }}
+          path: objects.tgz
+          retention-days: 3
+
       - name: Inspect closed KDK support libs
         if: always()
         run: |
