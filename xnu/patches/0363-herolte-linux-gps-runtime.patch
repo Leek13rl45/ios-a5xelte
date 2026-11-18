@@ -1,0 +1,1419 @@
+diff --git a/bsd/dev/herolte_linux.c b/bsd/dev/herolte_linux.c
+--- a/bsd/dev/herolte_linux.c
++++ b/bsd/dev/herolte_linux.c
+@@ -44,6 +44,14 @@
+ #include <sys/random.h>
+ #include <sys/filio.h>
+ #include <sys/wait.h>
++#include <sys/socket.h>
++#include <sys/socketvar.h>
++#include <sys/protosw.h>
++#include <sys/un.h>
++#include <sys/uio.h>
++#include <sys/kpi_socket.h>
++#include <sys/file.h>
++#include <netinet/in.h>
+ #include <libkern/OSAtomic.h>
+ #include <vm/vm_map.h>
+ #include <vm/vm_kern.h>
+@@ -78,6 +86,10 @@
+ extern int herolte_linux_statat(vfs_context_t, int, const char *, int, struct stat64 *);
+ extern int herolte_linux_mkdirat(vfs_context_t, int, const char *, int);
+ extern int herolte_linux_unlinkat(vfs_context_t, int, const char *, int);
++extern int herolte_linux_mkfifoat(vfs_context_t, int, const char *, int);
++extern int herolte_linux_fchmodat(vfs_context_t, int, const char *, int);
++extern int herolte_linux_chdir(vfs_context_t, const char *);
++extern int herolte_linux_getdirentries64(int, user_addr_t, user_size_t, ssize_t *);
+ 
+ static int lx_enabled = -1;
+ static int lx_trace;
+@@ -309,6 +321,37 @@
+ 	return false;
+ }
+ 
++/* Exact Linux paths served by iOS device nodes (bsd/dev/herolte_gps.c). */
++static const struct {
++	const char *lx;
++	const char *ios;
++} lx_devmap[] = {
++	{ "/dev/ttyBCM", "/dev/herobcm0" },
++	{ "/dev/bbd_sensor", "/dev/herobcm1" },
++	{ "/sys/class/sec/gps/GPS_PWR_EN/value", "/dev/herobcm2" },
++};
++
++/* Rewrite a Linux path (kernel string) into out[size]: device table, then
++ * relative and iOS paths unchanged, then everything else under LX_ROOT. */
++static int
++lx_rewrite(const char *in, char *out, size_t size)
++{
++	for (unsigned i = 0; i < sizeof(lx_devmap) / sizeof(lx_devmap[0]); i++) {
++		if (!strcmp(in, lx_devmap[i].lx)) {
++			return strlcpy(out, lx_devmap[i].ios, size) >= size ? ENAMETOOLONG : 0;
++		}
++	}
++	if (in[0] != '/' || lx_passthrough(in)) {
++		return strlcpy(out, in, size) >= size ? ENAMETOOLONG : 0;
++	}
++	if (strlen(LX_ROOT) + strlen(in) >= size) {
++		return ENAMETOOLONG;
++	}
++	strlcpy(out, LX_ROOT, size);
++	strlcat(out, in, size);
++	return 0;
++}
++
+ /* Copy a Linux path in and rewrite it. *out is kalloc'ed MAXPATHLEN bytes.
+  * *is_exe tells readlinkat that the caller asked for /proc/self/exe. */
+ static int
+@@ -338,13 +381,8 @@
+ 			} else {
+ 				error = ENOENT;
+ 			}
+-		} else if (in[0] != '/' || lx_passthrough(in)) {
+-			strlcpy(res, in, MAXPATHLEN);
+-		} else if (strlen(LX_ROOT) + strlen(in) >= MAXPATHLEN) {
+-			error = ENAMETOOLONG;
+ 		} else {
+-			strlcpy(res, LX_ROOT, MAXPATHLEN);
+-			strlcat(res, in, MAXPATHLEN);
++			error = lx_rewrite(in, res, MAXPATHLEN);
+ 		}
+ 	}
+ 	kfree_data(in, MAXPATHLEN);
+@@ -590,7 +628,9 @@
+ 	int32_t tid;
+ 
+ 	if ((flags & (LX_CLONE_VM | LX_CLONE_THREAD)) != (LX_CLONE_VM | LX_CLONE_THREAD)) {
+-		LXLOG("clone flags %#llx (process) unsupported", flags);
++		if (OSDecrementAtomic(&lx_unimpl_budget) > 0) {
++			LXLOG("clone flags %#llx (process) unsupported", flags);
++		}
+ 		return -LX_ENOSYS;
+ 	}
+ 	if (thread_create_immovable(current_task(), &th) != KERN_SUCCESS) {
+@@ -921,8 +961,644 @@
+ 	}
+ 	error = ioctl(p, &ia, &rv);
+ 	return error ? -lx_errno(error) : 0;
++}
++
++/* --- shared helpers for the calls below ------------------------------------ */
++
++#define LX_ENAMETOOLONG  36
++#define LX_ENOPROTOOPT   92
++#define LX_EAFNOSUPPORT  97
++#define LX_ECONNREFUSED  111
++
++#define LXLOG_ONCE(fmt, ...) do {                                       \
++	static volatile UInt32 lx_once_;                                \
++	if (OSCompareAndSwap(0, 1, &lx_once_)) {                        \
++	        LXLOG(fmt, ##__VA_ARGS__);                              \
++	}                                                               \
++} while (0)
++
++/* Darwin errno -> -Linux errno; blocking socket calls may return ERESTART. */
++static int64_t
++lx_err(int e)
++{
++	return -lx_errno(e == ERESTART ? EINTR : e);
++}
++
++static void
++lx_set_nonblock(proc_t p, int fd, bool on)
++{
++	int64_t fl = lx_fcntl(p, fd, 3, 0);
++	if (fl >= 0) {
++		(void)lx_fcntl(p, fd, 4, on ? ((uint64_t)fl | 0x800) : ((uint64_t)fl & ~(uint64_t)0x800));
++	}
++}
++
++/* SOCK_NONBLOCK / SOCK_CLOEXEC (= O_NONBLOCK / O_CLOEXEC) on a new fd. */
++#define LX_SOCK_NONBLOCK 0x800
++#define LX_SOCK_CLOEXEC  0x80000
++
++static void
++lx_fd_flags(proc_t p, int fd, uint64_t lflags)
++{
++	if (lflags & LX_SOCK_CLOEXEC) {
++		(void)lx_fcntl(p, fd, 2, 1);
++	}
++	if (lflags & LX_SOCK_NONBLOCK) {
++		lx_set_nonblock(p, fd, true);
++	}
++}
++
++/* --- sockets ----------------------------------------------------------------- */
++
++/*
++ * Socket addresses: Linux sockaddr starts with a 16-bit family, Darwin with
++ * (len, family); the rest of sockaddr_un/_in/_in6 is laid out identically.
++ * Input addresses (bind, connect, sendto) are translated into a kernel
++ * sockaddr_storage and handed to the socket layer directly: the sock_bind()
++ * and sock_connect() KPIs, and pru_sosend() for sendto (as sock_send_internal
++ * does, but with the data left in user space). Output addresses come from
++ * sock_get{sock,peer}name() into a kernel buffer (getsockname, getpeername,
++ * accept) or from Darwin recvfrom() into the caller's buffer, and are
++ * rewritten into Linux layout. AF_UNIX paths go through lx_rewrite() on the
++ * way in and lose the LX_ROOT prefix on the way out; abstract names are not
++ * supported. Every socket gets SO_NOSIGPIPE: Linux signals are not delivered,
++ * so a SIGPIPE on EPIPE would kill the process instead of returning -EPIPE.
++ */
++#define LX_AF_UNIX  1
++#define LX_AF_INET  2
++#define LX_AF_INET6 10
++
++static void
++lx_sock_setup(int fd)
++{
++	socket_t so;
++	int one = 1;
++	if (file_socket(fd, &so) == 0) {
++		(void)sock_setsockopt(so, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
++		file_drop(fd);
++	}
+ }
+ 
++/* Linux sockaddr (user) -> Darwin sockaddr (kernel). 0 or -Linux errno. */
++static int64_t
++lx_sockaddr_in(user_addr_t ua, uint64_t ulen, struct sockaddr_storage *ss, int64_t abstract_err)
++{
++	uint8_t lb[128] = {};
++	uint16_t fam;
++
++	bzero(ss, sizeof(*ss));
++	if (ulen < 2 || ulen > sizeof(lb)) {
++		return -LX_EINVAL;
++	}
++	if (copyin(ua, lb, (size_t)ulen)) {
++		return -LX_EFAULT;
++	}
++	memcpy(&fam, lb, sizeof(fam));
++	switch (fam) {
++	case LX_AF_UNIX: {
++		struct sockaddr_un *sun = (struct sockaddr_un *)ss;
++		char path[109];
++		size_t n = MIN((size_t)ulen - 2, sizeof(path) - 1);
++		memcpy(path, lb + 2, n);
++		path[n] = 0;
++		if (path[0] == 0) {
++			return abstract_err;            /* unnamed or abstract */
++		}
++		if (lx_rewrite(path, sun->sun_path, sizeof(sun->sun_path))) {
++			return -LX_ENAMETOOLONG;
++		}
++		sun->sun_family = AF_UNIX;
++		sun->sun_len = (uint8_t)(offsetof(struct sockaddr_un, sun_path) + strlen(sun->sun_path) + 1);
++		return 0;
++	}
++	case LX_AF_INET:
++		if (ulen < sizeof(struct sockaddr_in)) {
++			return -LX_EINVAL;
++		}
++		memcpy((uint8_t *)ss + 2, lb + 2, sizeof(struct sockaddr_in) - 2);
++		ss->ss_len = sizeof(struct sockaddr_in);
++		ss->ss_family = AF_INET;
++		return 0;
++	case LX_AF_INET6:
++		if (ulen < 24) {                        /* SIN6_LEN_RFC2133 */
++			return -LX_EINVAL;
++		}
++		memcpy((uint8_t *)ss + 2, lb + 2, MIN((size_t)ulen, sizeof(struct sockaddr_in6)) - 2);
++		ss->ss_len = sizeof(struct sockaddr_in6);
++		ss->ss_family = AF_INET6;
++		return 0;
++	default:
++		return -LX_EAFNOSUPPORT;
++	}
++}
++
++/* Darwin sockaddr (kernel, dlen bytes) -> Linux sockaddr at ua (cap bytes),
++ * length at ulenp. */
++static int64_t
++lx_sockaddr_out(const uint8_t *da, size_t dlen, user_addr_t ua, user_addr_t ulenp, uint32_t cap)
++{
++	uint8_t lb[132] = {};
++	uint16_t fam = 0;
++	uint32_t llen = 2;
++
++	if (dlen >= 1 && da[0] >= 2) {
++		dlen = MIN(dlen, (size_t)da[0]);
++	}
++	dlen = MIN(dlen, (size_t)128);
++	if (dlen >= 2) {
++		switch (da[1]) {
++		case AF_UNIX: {
++			const char *path = (const char *)da + 2;
++			size_t n = strnlen(path, dlen - 2), skip = 0, rl = strlen(LX_ROOT);
++			if (n > rl && !strncmp(path, LX_ROOT, rl) && path[rl] == '/') {
++				skip = rl;
++			}
++			memcpy(lb + 2, path + skip, n - skip);
++			fam = LX_AF_UNIX;
++			llen = n ? (uint32_t)(2 + (n - skip) + 1) : 2;
++			break;
++		}
++		case AF_INET:
++			fam = LX_AF_INET;
++			llen = sizeof(struct sockaddr_in);
++			memcpy(lb + 2, da + 2, MIN(dlen, (size_t)llen) - 2);
++			break;
++		case AF_INET6:
++			fam = LX_AF_INET6;
++			llen = sizeof(struct sockaddr_in6);
++			memcpy(lb + 2, da + 2, MIN(dlen, (size_t)llen) - 2);
++			break;
++		default:
++			fam = da[1];
++			llen = (uint32_t)dlen;
++			memcpy(lb + 2, da + 2, dlen - 2);
++			break;
++		}
++	}
++	memcpy(lb, &fam, sizeof(fam));
++	if (copyout(lb, ua, MIN(cap, llen)) || copyout(&llen, ulenp, sizeof(llen))) {
++		return -LX_EFAULT;
++	}
++	return 0;
++}
++
++static int64_t
++lx_sockname(int fd, bool peer, user_addr_t ua, user_addr_t ulenp)
++{
++	struct sockaddr_storage ss = {};
++	socket_t so;
++	uint32_t cap;
++	int error;
++
++	if (!ua || !ulenp) {
++		return -LX_EFAULT;
++	}
++	if (copyin(ulenp, &cap, sizeof(cap))) {
++		return -LX_EFAULT;
++	}
++	if ((error = file_socket(fd, &so)) != 0) {
++		return -lx_errno(error);
++	}
++	error = peer ? sock_getpeername(so, (struct sockaddr *)&ss, sizeof(ss)) :
++	    sock_getsockname(so, (struct sockaddr *)&ss, sizeof(ss));
++	file_drop(fd);
++	if (error) {
++		return -lx_errno(error);
++	}
++	return lx_sockaddr_out((const uint8_t *)&ss, sizeof(ss), ua, ulenp, cap);
++}
++
++static int64_t
++lx_socket(proc_t p, uint64_t domain, uint64_t ltype, uint64_t proto)
++{
++	struct socket_args sa = { .type = (int)(ltype & 0xf), .protocol = (int)proto };
++	int32_t fd = -1;
++	int error;
++
++	switch (domain) {
++	case LX_AF_UNIX: sa.domain = AF_UNIX; break;
++	case LX_AF_INET: sa.domain = AF_INET; break;
++	case LX_AF_INET6: sa.domain = AF_INET6; break;
++	default:
++		if (OSDecrementAtomic(&lx_unimpl_budget) > 0) {
++			LXLOG("socket domain %llu type %#llx unsupported", domain, ltype);
++		}
++		return -LX_EAFNOSUPPORT;
++	}
++	error = socket(p, &sa, &fd);
++	if (error) {
++		return lx_err(error);
++	}
++	lx_sock_setup(fd);
++	lx_fd_flags(p, fd, ltype);
++	return fd;
++}
++
++static int64_t
++lx_socketpair(proc_t p, uint64_t domain, uint64_t ltype, uint64_t proto, user_addr_t usv)
++{
++	struct socketpair_args sa = {
++		.domain = AF_UNIX, .type = (int)(ltype & 0xf), .protocol = (int)proto, .rsv = usv,
++	};
++	int32_t sv[2], rv = 0;
++	int error;
++
++	if (domain != LX_AF_UNIX) {
++		return -LX_EAFNOSUPPORT;
++	}
++	error = socketpair(p, &sa, &rv);     /* copies the two fds out to usv */
++	if (error) {
++		return lx_err(error);
++	}
++	if (copyin(usv, sv, sizeof(sv))) {
++		return -LX_EFAULT;
++	}
++	for (int i = 0; i < 2; i++) {
++		lx_sock_setup(sv[i]);
++		lx_fd_flags(p, sv[i], ltype);
++	}
++	return 0;
++}
++
++static int64_t
++lx_bind_connect(int fd, user_addr_t ua, uint64_t ulen, bool conn)
++{
++	struct sockaddr_storage ss;
++	socket_t so;
++	int error;
++	int64_t r = lx_sockaddr_in(ua, ulen, &ss, conn ? -LX_ECONNREFUSED : -LX_ENOENT);
++
++	if (r) {
++		if (lx_trace) {
++			LXLOG("%s fd %d: Linux address rejected (%lld)", conn ? "connect" : "bind", fd, r);
++		}
++		return r;
++	}
++	if ((error = file_socket(fd, &so)) != 0) {
++		return -lx_errno(error);
++	}
++	error = conn ? sock_connect(so, (struct sockaddr *)&ss, 0) : sock_bind(so, (struct sockaddr *)&ss);
++	file_drop(fd);
++	if (lx_trace && ss.ss_family == AF_UNIX) {
++		LXLOG("%s fd %d %s = %d", conn ? "connect" : "bind", fd,
++		    ((struct sockaddr_un *)&ss)->sun_path, error);
++	}
++	return error ? lx_err(error) : 0;
++}
++
++static int64_t
++lx_accept(proc_t p, int fd, user_addr_t ua, user_addr_t ulenp, uint64_t flags)
++{
++	struct accept_args aa = { .s = fd, .name = USER_ADDR_NULL, .anamelen = USER_ADDR_NULL };
++	int32_t nfd = -1;
++	int error = accept(p, &aa, &nfd);
++
++	if (error) {
++		return lx_err(error);
++	}
++	lx_sock_setup(nfd);
++	/* Darwin inherits O_NONBLOCK from the listener, Linux does not. */
++	lx_set_nonblock(p, nfd, (flags & LX_SOCK_NONBLOCK) != 0);
++	if (flags & LX_SOCK_CLOEXEC) {
++		(void)lx_fcntl(p, nfd, 2, 1);
++	}
++	if (ua && ulenp && lx_sockname(nfd, true, ua, ulenp) != 0) {
++		uint32_t zero = 0;                      /* peer gone: no address */
++		(void)copyout(&zero, ulenp, sizeof(zero));
++	}
++	return nfd;
++}
++
++/* Linux MSG_* -> Darwin MSG_*. MSG_NOSIGNAL: sockets have SO_NOSIGPIPE. */
++static int
++lx_msg_flags(uint64_t lf)
++{
++	int f = (int)(lf & 7);                          /* OOB, PEEK, DONTROUTE */
++	if (lf & 0x20) {
++		f |= MSG_TRUNC;
++	}
++	if (lf & 0x40) {
++		f |= MSG_DONTWAIT;
++	}
++	if (lf & 0x80) {
++		f |= MSG_EOR;
++	}
++	if (lf & 0x100) {
++		f |= MSG_WAITALL;
++	}
++	return f;
++}
++
++static int64_t
++lx_sendto(proc_t p, int fd, user_addr_t buf, uint64_t len, uint64_t lflags, user_addr_t to, uint64_t tolen)
++{
++	struct sockaddr_storage ss;
++	socket_t so;
++	uio_t auio;
++	user_ssize_t sent;
++	int error, flags = lx_msg_flags(lflags);
++	int64_t r;
++
++	if (len > INT_MAX) {
++		return -LX_EINVAL;
++	}
++	if (!to) {
++		struct sendto_args sa = { .s = fd, .buf = buf, .len = len, .flags = flags };
++		int32_t rv = 0;
++		error = sendto(p, &sa, &rv);
++		return error ? lx_err(error) : rv;
++	}
++	if ((r = lx_sockaddr_in(to, tolen, &ss, -LX_ECONNREFUSED)) != 0) {
++		return r;
++	}
++	if ((error = file_socket(fd, &so)) != 0) {
++		return -lx_errno(error);
++	}
++	auio = uio_create(1, 0, UIO_USERSPACE64, UIO_WRITE);
++	if (auio == NULL) {
++		file_drop(fd);
++		return -LX_ENOMEM;
++	}
++	uio_addiov(auio, buf, (user_size_t)len);
++	error = so->so_proto->pr_usrreqs->pru_sosend(so, (struct sockaddr *)&ss, auio, NULL, NULL, flags);
++	sent = (user_ssize_t)len - uio_resid(auio);
++	if (sent && (error == ERESTART || error == EINTR || error == EWOULDBLOCK)) {
++		error = 0;
++	}
++	uio_free(auio);
++	file_drop(fd);
++	return error ? lx_err(error) : (int64_t)sent;
++}
++
++static int64_t
++lx_recvfrom(proc_t p, int fd, user_addr_t buf, uint64_t len, uint64_t lflags, user_addr_t from, user_addr_t fromlenp)
++{
++	struct recvfrom_args ra = { .s = fd, .buf = buf, .len = len, .flags = lx_msg_flags(lflags) };
++	uint32_t cap = 0, got = 0;
++	uint8_t da[128];
++	int32_t rv = 0;
++	int error;
++
++	if (from && fromlenp) {
++		if (copyin(fromlenp, &cap, sizeof(cap))) {
++			return -LX_EFAULT;
++		}
++		ra.from = from;                         /* Darwin layout lands here first */
++		ra.fromlenaddr = fromlenp;
++	}
++	error = recvfrom(p, &ra, &rv);
++	if (error) {
++		return lx_err(error);
++	}
++	if (ra.from) {
++		if (copyin(fromlenp, &got, sizeof(got))) {
++			return -LX_EFAULT;
++		}
++		got = MIN(got, (uint32_t)sizeof(da));
++		if (got >= 2 && copyin(from, da, got) == 0) {
++			(void)lx_sockaddr_out(da, got, from, fromlenp, cap);
++		}
++	}
++	return rv;
++}
++
++/* Linux (level, optname) -> Darwin. */
++static bool
++lx_sockopt(int llevel, int lname, int *level, int *name)
++{
++	static const int sol[][2] = {
++		{ 2, SO_REUSEADDR }, { 3, SO_TYPE }, { 4, SO_ERROR }, { 5, SO_DONTROUTE },
++		{ 6, SO_BROADCAST }, { 7, SO_SNDBUF }, { 8, SO_RCVBUF }, { 9, SO_KEEPALIVE },
++		{ 10, SO_OOBINLINE }, { 13, SO_LINGER_SEC }, { 15, SO_REUSEPORT },
++		{ 18, SO_RCVLOWAT }, { 19, SO_SNDLOWAT }, { 20, SO_RCVTIMEO }, { 21, SO_SNDTIMEO },
++	};
++	static const int tcp[][2] = {
++		{ 1, 0x1 /* TCP_NODELAY */ }, { 4, 0x10 /* TCP_KEEPALIVE */ },
++		{ 5, 0x101 /* TCP_KEEPINTVL */ }, { 6, 0x102 /* TCP_KEEPCNT */ },
++	};
++	const int (*tab)[2];
++	unsigned n;
++
++	if (llevel == 1) {
++		tab = sol;
++		n = sizeof(sol) / sizeof(sol[0]);
++		*level = SOL_SOCKET;
++	} else if (llevel == IPPROTO_TCP) {
++		tab = tcp;
++		n = sizeof(tcp) / sizeof(tcp[0]);
++		*level = IPPROTO_TCP;
++	} else {
++		return false;
++	}
++	for (unsigned i = 0; i < n; i++) {
++		if (tab[i][0] == lname) {
++			*name = tab[i][1];
++			return true;
++		}
++	}
++	return false;
++}
++
++static int64_t
++lx_setsockopt(proc_t p, int fd, int llevel, int lname, user_addr_t val, uint64_t vlen)
++{
++	struct setsockopt_args sa = { .s = fd, .val = val, .valsize = (socklen_t)vlen };
++	int32_t rv = 0;
++	int error;
++
++	if (llevel == 1 && lname == 16) {               /* SO_PASSCRED */
++		return 0;
++	}
++	if (!lx_sockopt(llevel, lname, &sa.level, &sa.name)) {
++		if (OSDecrementAtomic(&lx_unimpl_budget) > 0) {
++			LXLOG("setsockopt level %d name %d ignored", llevel, lname);
++		}
++		return 0;
++	}
++	/* Linux timeval {s64, s64} reads as Darwin user64_timeval {s64, s32, pad}. */
++	error = setsockopt(p, &sa, &rv);
++	return error ? lx_err(error) : 0;
++}
++
++static int64_t
++lx_peercred(int fd, user_addr_t val, user_addr_t ulenp)
++{
++	struct { int32_t pid; uint32_t uid; uint32_t gid; } cred = {
++		proc_pid(current_proc()), kauth_getuid(), kauth_getgid(),
++	};
++	uint32_t cap, n = sizeof(cred);
++	socket_t so;
++	int pid = 0, len = sizeof(pid);
++
++	if (copyin(ulenp, &cap, sizeof(cap))) {
++		return -LX_EFAULT;
++	}
++	if (file_socket(fd, &so) == 0) {
++		if (sock_getsockopt(so, SOL_LOCAL, LOCAL_PEERPID, &pid, &len) == 0 && pid > 0) {
++			cred.pid = pid;
++		}
++		file_drop(fd);
++	}
++	if (copyout(&cred, val, MIN(cap, n)) || copyout(&n, ulenp, sizeof(n))) {
++		return -LX_EFAULT;
++	}
++	return 0;
++}
++
++static int64_t
++lx_getsockopt(proc_t p, int fd, int llevel, int lname, user_addr_t val, user_addr_t ulenp)
++{
++	struct getsockopt_args ga = { .s = fd, .val = val, .avalsize = ulenp };
++	int32_t rv = 0;
++	int error;
++
++	if (llevel == 1 && lname == 17) {               /* SO_PEERCRED */
++		return lx_peercred(fd, val, ulenp);
++	}
++	if (!lx_sockopt(llevel, lname, &ga.level, &ga.name)) {
++		if (OSDecrementAtomic(&lx_unimpl_budget) > 0) {
++			LXLOG("getsockopt level %d name %d unsupported", llevel, lname);
++		}
++		return -LX_ENOPROTOOPT;
++	}
++	error = getsockopt(p, &ga, &rv);
++	if (error) {
++		return lx_err(error);
++	}
++	if (ga.level == SOL_SOCKET && ga.name == SO_ERROR) {
++		int32_t e;
++		if (!copyin(val, &e, sizeof(e)) && e) {
++			e = lx_errno(e);
++			(void)copyout(&e, val, sizeof(e));
++		}
++	} else if (ga.level == SOL_SOCKET && (ga.name == SO_RCVTIMEO || ga.name == SO_SNDTIMEO)) {
++		uint8_t tv[16];
++		uint32_t n;
++		if (!copyin(ulenp, &n, sizeof(n)) && n >= sizeof(tv) && !copyin(val, tv, sizeof(tv))) {
++			int32_t us;
++			int64_t us64;
++			memcpy(&us, tv + 8, sizeof(us));
++			us64 = us;                      /* drop Darwin's padding word */
++			memcpy(tv + 8, &us64, sizeof(us64));
++			(void)copyout(tv, val, sizeof(tv));
++		}
++	}
++	return 0;
++}
++
++/* --- directories, polling, misc -------------------------------------------------- */
++
++/*
++ * getdents64: Darwin getdirentries64 writes struct direntry records into the
++ * caller's buffer (and advances the fd offset); they are read back and
++ * rewritten in place as linux_dirent64 records, which are never longer.
++ * direntry: ino@0 u64, seekoff@8 u64, reclen@16 u16, namlen@18 u16, type@20,
++ * name@21. linux_dirent64: ino@0, off@8, reclen@16 u16, type@18, name@19.
++ */
++static int64_t
++lx_getdents64(int fd, user_addr_t ub, uint64_t count)
++{
++	ssize_t n = 0;
++	size_t in = 0, out = 0;
++	uint8_t *buf;
++	int error;
++
++	count = MIN(count, (uint64_t)65536);
++	error = herolte_linux_getdirentries64(fd, ub, (user_size_t)count, &n);
++	if (error) {
++		return -lx_errno(error);
++	}
++	if (n <= 0) {
++		return 0;
++	}
++	buf = kalloc_data((vm_size_t)n, Z_WAITOK);
++	if (buf == NULL) {
++		return -LX_ENOMEM;
++	}
++	if (copyin(ub, buf, (size_t)n)) {
++		kfree_data(buf, (vm_size_t)n);
++		return -LX_EFAULT;
++	}
++	while (in + 21 <= (size_t)n) {
++		uint64_t ino, off;
++		uint16_t drec, nlen, lrec;
++		uint8_t type;
++		memcpy(&ino, buf + in, 8);
++		memcpy(&off, buf + in + 8, 8);
++		memcpy(&drec, buf + in + 16, 2);
++		memcpy(&nlen, buf + in + 18, 2);
++		type = buf[in + 20];
++		if (drec < 22 || in + drec > (size_t)n || (size_t)nlen + 22 > drec) {
++			break;
++		}
++		lrec = (uint16_t)((19 + nlen + 1 + 7) & ~7);
++		memmove(buf + out + 19, buf + in + 21, nlen);
++		memcpy(buf + out, &ino, 8);
++		memcpy(buf + out + 8, &off, 8);
++		memcpy(buf + out + 16, &lrec, 2);
++		buf[out + 18] = type;
++		bzero(buf + out + 19 + nlen, (size_t)lrec - 19 - nlen);
++		out += lrec;
++		in += drec;
++	}
++	error = copyout(buf, ub, out);
++	kfree_data(buf, (vm_size_t)n);
++	return error ? -LX_EFAULT : (int64_t)out;
++}
++
++struct lx_sysinfo {
++	int64_t  uptime;
++	uint64_t loads[3];
++	uint64_t totalram, freeram, sharedram, bufferram, totalswap, freeswap;
++	uint16_t procs, pad;
++	uint32_t pad2;
++	uint64_t totalhigh, freehigh;
++	uint32_t mem_unit;
++	uint32_t pad3;
++};
++_Static_assert(sizeof(struct lx_sysinfo) == 112, "Linux arm64 struct sysinfo");
++
++static int64_t
++lx_sysinfo(user_addr_t ub)
++{
++	struct lx_sysinfo si = {};
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_continuous_time(), &ns);
++	si.uptime = (int64_t)(ns / NSEC_PER_SEC);
++	si.totalram = max_mem;
++	si.freeram = max_mem / 2;                       /* approximation */
++	si.procs = 1;
++	si.mem_unit = 1;
++	return copyout(&si, ub, sizeof(si)) ? -LX_EFAULT : 0;
++}
++
++static void
++lx_log_exec(user_addr_t upath, user_addr_t uargv)
++{
++	char *buf;
++	size_t len = 0;
++	if (OSDecrementAtomic(&lx_unimpl_budget) <= 0) {
++		return;
++	}
++	buf = kalloc_data(MAXPATHLEN, Z_WAITOK);
++	if (buf == NULL) {
++		return;
++	}
++	if (copyinstr(upath, buf, MAXPATHLEN, &len)) {
++		strlcpy(buf, "?", MAXPATHLEN);
++	}
++	LXLOG("execve %s unsupported", buf);
++	for (int i = 0; i < 6 && uargv; i++) {
++		uint64_t ua;
++		if (copyin(uargv + 8 * (uint64_t)i, &ua, sizeof(ua)) || !ua ||
++		    copyinstr(ua, buf, 256, &len)) {
++			break;
++		}
++		LXLOG("  argv[%d] %s", i, buf);
++	}
++	kfree_data(buf, MAXPATHLEN);
++}
++
+ /* --- dispatcher ------------------------------------------------------------ */
+ 
+ static int64_t
+@@ -961,6 +1637,26 @@
+ 		return lx_fcntl(p, (int)a[0], (int)a[1], a[2]);
+ 	case 29:                                        /* ioctl */
+ 		return lx_ioctl(p, (int)a[0], a[1], a[2]);
++	case 33: {                                      /* mknodat */
++		int type = (int)a[2] & S_IFMT;
++		if (type != S_IFIFO && type != S_IFREG && type != 0) {
++			return -LX_EPERM;
++		}
++		if ((error = lx_path(a[1], &kp)) == 0) {
++			if (type == S_IFIFO) {
++				error = herolte_linux_mkfifoat(ctx, lx_dirfd(a[0]), kp, (int)a[2]);
++			} else {
++				error = herolte_linux_openat(ctx, lx_dirfd(a[0]), kp, O_WRONLY | O_CREAT | O_EXCL,
++				    (int)a[2] & ALLPERMS, &ival);
++				if (!error) {
++					struct close_args ca = { .fd = ival };
++					(void)sys_close(p, &ca, &ival);
++				}
++			}
++			lx_path_free(kp);
++		}
++		return error ? -lx_errno(error) : 0;
++	}
+ 	case 34:                                        /* mkdirat */
+ 		if ((error = lx_path(a[1], &kp)) == 0) {
+ 			error = herolte_linux_mkdirat(ctx, lx_dirfd(a[0]), kp, (int)a[2]);
+@@ -976,6 +1672,11 @@
+ 	case 43:                                        /* statfs */
+ 	case 44:                                        /* fstatfs */
+ 		return lx_fake_statfs(a[1]);
++	case 46: {                                      /* ftruncate */
++		struct ftruncate_args ta = { .fd = (int)a[0], .length = (off_t)a[1] };
++		error = ftruncate(p, &ta, &ival);
++		return error ? -lx_errno(error) : 0;
++	}
+ 	case 48:                                        /* faccessat */
+ 	case 439:                                       /* faccessat2 */
+ 		if ((error = lx_path(a[1], &kp)) == 0) {
+@@ -983,6 +1684,26 @@
+ 			lx_path_free(kp);
+ 		}
+ 		return error ? -lx_errno(error) : 0;
++	case 49:                                        /* chdir */
++		if ((error = lx_path(a[0], &kp)) == 0) {
++			error = herolte_linux_chdir(ctx, kp);
++			lx_path_free(kp);
++		}
++		return error ? -lx_errno(error) : 0;
++	case 52: {                                      /* fchmod */
++		struct fchmod_args fa = { .fd = (int)a[0], .mode = (int)a[1] };
++		error = fchmod(p, &fa, &ival);
++		return error ? -lx_errno(error) : 0;
++	}
++	case 53:                                        /* fchmodat */
++		if ((error = lx_path(a[1], &kp)) == 0) {
++			error = herolte_linux_fchmodat(ctx, lx_dirfd(a[0]), kp, (int)a[2]);
++			lx_path_free(kp);
++		}
++		return error ? -lx_errno(error) : 0;
++	case 54:                                        /* fchownat */
++	case 55:                                        /* fchown */
++		return 0;                               /* single user */
+ 	case 56:                                        /* openat */
+ 		if ((error = lx_path(a[1], &kp)) == 0) {
+ 			error = herolte_linux_openat(ctx, lx_dirfd(a[0]), kp, lx_open_flags(a[2]),
+@@ -997,7 +1718,28 @@
+ 		struct close_args ca = { .fd = (int)a[0] };
+ 		error = sys_close(p, &ca, &ival);
+ 		return error ? -lx_errno(error) : 0;
++	}
++	case 59: {                                      /* pipe2 */
++		struct pipe_args pa = {};
++		int32_t fds[2] = { -1, -1 };
++		error = pipe(p, &pa, fds);
++		if (error) {
++			return -lx_errno(error);
++		}
++		for (int i = 0; i < 2; i++) {
++			lx_fd_flags(p, fds[i], a[1]);
++		}
++		if (copyout(fds, a[0], sizeof(fds))) {
++			for (int i = 0; i < 2; i++) {
++				struct close_args ca = { .fd = fds[i] };
++				(void)sys_close(p, &ca, &ival);
++			}
++			return -LX_EFAULT;
++		}
++		return 0;
+ 	}
++	case 61:                                        /* getdents64 */
++		return lx_getdents64((int)a[0], a[1], a[2]);
+ 	case 62: {                                      /* lseek */
+ 		struct lseek_args la = { .fd = (int)a[0], .offset = (off_t)a[1], .whence = (int)a[2] };
+ 		off_t off = 0;
+@@ -1045,6 +1787,33 @@
+ 		error = pwrite(p, &pa, &sval);
+ 		return error ? -lx_errno(error) : sval;
+ 	}
++	case 72: {                                      /* pselect6 */
++		/* select keeps uap/retval for its continuation: no stack storage. */
++		struct pselect_args *pa = (struct pselect_args *)(void *)ut->uu_arg;
++		_Static_assert(sizeof(struct pselect_args) <= sizeof(((struct uthread *)0)->uu_arg), "uu_arg");
++		*pa = (struct pselect_args){
++			.nd = (int)a[0], .in = a[1], .ou = a[2], .ex = a[3], .ts = a[4], .mask = USER_ADDR_NULL,
++		};
++		error = pselect(p, pa, &ut->uu_rval[0]);
++		return error ? lx_err(error) : ut->uu_rval[0];
++	}
++	case 73: {                                      /* ppoll */
++		struct poll_args pa = { .fds = a[0], .nfds = (u_int)a[1], .timeout = -1 };
++		if (a[2]) {
++			struct lx_timespec ts;
++			uint64_t ms;
++			if (copyin(a[2], &ts, sizeof(ts))) {
++				return -LX_EFAULT;
++			}
++			if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= (int64_t)NSEC_PER_SEC) {
++				return -LX_EINVAL;
++			}
++			ms = (uint64_t)ts.tv_sec * 1000 + ((uint64_t)ts.tv_nsec + 999999) / 1000000;
++			pa.timeout = ms > INT32_MAX ? INT32_MAX : (int)ms;
++		}
++		error = poll(p, &pa, &ut->uu_rval[0]);
++		return error ? lx_err(error) : ut->uu_rval[0];
++	}
+ 	case 78: {                                      /* readlinkat */
+ 		bool is_exe;
+ 		if ((error = lx_path_ex(a[1], &kp, &is_exe)) == 0) {
+@@ -1082,6 +1851,14 @@
+ 			return -lx_errno(error);
+ 		}
+ 		return lx_copyout_stat(&sb, a[1]) ? -LX_EFAULT : 0;
++	case 81:                                        /* sync */
++		return 0;
++	case 82:                                        /* fsync */
++	case 83: {                                      /* fdatasync */
++		struct fsync_args fa = { .fd = (int)a[0] };
++		error = fsync(p, &fa, &ival);
++		return error ? lx_err(error) : 0;
++	}
+ 	case 93:                                        /* exit (thread) */
+ 		lx_clear_child_tid(p, ut, lt);
+ 		if (get_task_numacts(current_task()) <= 1) {
+@@ -1191,6 +1968,46 @@
+ 		return kauth_getgid();
+ 	case 178:                                       /* gettid */
+ 		return lt->tid;
++	case 179:                                       /* sysinfo */
++		return lx_sysinfo(a[0]);
++	case 198:                                       /* socket */
++		return lx_socket(p, a[0], a[1], a[2]);
++	case 199:                                       /* socketpair */
++		return lx_socketpair(p, a[0], a[1], a[2], a[3]);
++	case 200:                                       /* bind */
++		return lx_bind_connect((int)a[0], a[1], a[2], false);
++	case 201: {                                     /* listen */
++		struct listen_args la = { .s = (int)a[0], .backlog = (int)a[1] };
++		error = listen(p, &la, &ival);
++		return error ? lx_err(error) : 0;
++	}
++	case 202:                                       /* accept */
++		return lx_accept(p, (int)a[0], a[1], a[2], 0);
++	case 242:                                       /* accept4 */
++		return lx_accept(p, (int)a[0], a[1], a[2], a[3]);
++	case 203:                                       /* connect */
++		return lx_bind_connect((int)a[0], a[1], a[2], true);
++	case 204:                                       /* getsockname */
++		return lx_sockname((int)a[0], false, a[1], a[2]);
++	case 205:                                       /* getpeername */
++		return lx_sockname((int)a[0], true, a[1], a[2]);
++	case 206:                                       /* sendto */
++		return lx_sendto(p, (int)a[0], a[1], a[2], a[3], a[4], a[5]);
++	case 207:                                       /* recvfrom */
++		return lx_recvfrom(p, (int)a[0], a[1], a[2], a[3], a[4], a[5]);
++	case 208:                                       /* setsockopt */
++		return lx_setsockopt(p, (int)a[0], (int)a[1], (int)a[2], a[3], a[4]);
++	case 209:                                       /* getsockopt */
++		return lx_getsockopt(p, (int)a[0], (int)a[1], (int)a[2], a[3], a[4]);
++	case 210: {                                     /* shutdown */
++		struct shutdown_args sa = { .s = (int)a[0], .how = (int)a[1] };
++		error = shutdown(p, &sa, &ival);
++		return error ? lx_err(error) : 0;
++	}
++	case 211:                                       /* sendmsg */
++	case 212:                                       /* recvmsg */
++		LXLOG_ONCE("%s unimplemented (fd %d)", nr == 211 ? "sendmsg" : "recvmsg", (int)a[0]);
++		return -LX_ENOSYS;
+ 	case 215: {                                     /* munmap */
+ 		uint64_t pm = lx_pagemask();
+ 		uint64_t s0 = (a[0] + pm) & ~pm, e0 = (a[0] + a[1]) & ~pm;
+@@ -1203,6 +2020,9 @@
+ 	}
+ 	case 220:                                       /* clone */
+ 		return lx_clone(state, a[0], a[1], a[2], a[3], a[4]);
++	case 221:                                       /* execve */
++		lx_log_exec(a[0], a[1]);
++		return -LX_ENOSYS;
+ 	case 222:                                       /* mmap */
+ 		return lx_mmap(p, a[0], a[1], (int)a[2], a[3], (int)a[4], a[5]);
+ 	case 226: {                                     /* mprotect */
+@@ -1221,6 +2041,23 @@
+ 	}
+ 	case 233:                                       /* madvise */
+ 		return 0;
++	case 260: {                                     /* wait4 */
++		/* wait4 keeps uap/retval for its continuation: no stack storage. */
++		struct wait4_args *wa = (struct wait4_args *)(void *)ut->uu_arg;
++		_Static_assert(sizeof(struct wait4_args) <= sizeof(((struct uthread *)0)->uu_arg), "uu_arg");
++		if (a[3]) {
++			uint8_t ru[144] = {};           /* Linux struct rusage: zeroes */
++			if (copyout(ru, a[3], sizeof(ru))) {
++				return -LX_EFAULT;
++			}
++		}
++		*wa = (struct wait4_args){
++			.pid = (int)a[0], .status = a[1], .options = (int)a[2] & (WNOHANG | WUNTRACED),
++			.rusage = USER_ADDR_NULL,
++		};
++		error = wait4(p, wa, &ut->uu_rval[0]);
++		return error ? lx_err(error) : ut->uu_rval[0];
++	}
+ 	case 261:                                       /* prlimit64 */
+ 		if (a[3]) {
+ 			uint64_t lim[2] = { 8 << 20, UINT64_MAX };
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -14646,4 +14646,72 @@
+ 		return rmdirat_internal(ctx, fd, CAST_USER_ADDR_T(kpath), UIO_SYSSPACE, 0);
+ 	}
+ 	return unlinkat_internal(ctx, fd, NULLVP, CAST_USER_ADDR_T(kpath), UIO_SYSSPACE, 0);
++}
++
++int herolte_linux_mkfifoat(vfs_context_t ctx, int fd, const char *kpath, int mode);
++int herolte_linux_fchmodat(vfs_context_t ctx, int fd, const char *kpath, int mode);
++int herolte_linux_chdir(vfs_context_t ctx, const char *kpath);
++int herolte_linux_getdirentries64(int fd, user_addr_t buf, user_size_t bufsize, ssize_t *bytesread);
++
++/* mkfifo1() with a kernel path. */
++int
++herolte_linux_mkfifoat(vfs_context_t ctx, int fd, const char *kpath, int mode)
++{
++	struct vnode_attr va;
++	struct nameidata nd;
++	vnode_t vp, dvp;
++	int error;
++
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_mode, (mode & ALLPERMS) & ~vfs_context_proc(ctx)->p_fd.fd_cmask);
++	NDINIT(&nd, CREATE, OP_MKFIFO, LOCKPARENT | AUDITVNPATH1,
++	    UIO_SYSSPACE, CAST_USER_ADDR_T(kpath), ctx);
++	error = nameiat(&nd, fd);
++	if (error) {
++		return error;
++	}
++	dvp = nd.ni_dvp;
++	vp = nd.ni_vp;
++	if (vp != NULL) {
++		error = EEXIST;
++		goto out;
++	}
++	VATTR_SET(&va, va_type, VFIFO);
++	if ((error = vn_authorize_create(dvp, &nd.ni_cnd, &va, ctx, NULL)) != 0) {
++		goto out;
++	}
++	error = vn_create(dvp, &vp, &nd, &va, 0, 0, NULL, ctx);
++out:
++	nameidone(&nd);
++	if (vp) {
++		vnode_put(vp);
++	}
++	vnode_put(dvp);
++	return error;
+ }
++
++int
++herolte_linux_fchmodat(vfs_context_t ctx, int fd, const char *kpath, int mode)
++{
++	return fchmodat_internal(ctx, CAST_USER_ADDR_T(kpath), mode, fd, 0, UIO_SYSSPACE);
++}
++
++int
++herolte_linux_chdir(vfs_context_t ctx, const char *kpath)
++{
++	struct nameidata nd;
++
++	NDINIT(&nd, LOOKUP, OP_CHDIR, FOLLOW | AUDITVNPATH1,
++	    UIO_SYSSPACE, CAST_USER_ADDR_T(kpath), ctx);
++	return chdir_internal(vfs_context_proc(ctx), ctx, &nd, 0);
++}
++
++/* Extended (struct direntry) records into a user buffer; advances the fd offset. */
++int
++herolte_linux_getdirentries64(int fd, user_addr_t buf, user_size_t bufsize, ssize_t *bytesread)
++{
++	int eofflag = 0;
++
++	return getdirentries_common(fd, buf, bufsize, bytesread, NULL, &eofflag,
++	           VNODE_READDIR_EXTENDED);
++}
+diff --git a/bsd/dev/herolte_gps.c b/bsd/dev/herolte_gps.c
+--- a/bsd/dev/herolte_gps.c
++++ b/bsd/dev/herolte_gps.c
+@@ -8,6 +8,17 @@
+ #include <machine/machine_routines.h>
+ #include <vm/memory_types.h>
+ #include <pexpert/pexpert.h>
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <sys/select.h>
++#include <sys/proc.h>
++#include <sys/fcntl.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <sys/kernel.h>
++#include <sys/vnode.h>
+ 
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, unsigned int);
+ extern void ml_io_unmap(vm_offset_t, vm_size_t);
+@@ -423,8 +434,343 @@
+ 	printf("HEROLTE GPS: replay sent %u/%u records %lu bytes; chip packets %u frames %u bytes %u; late %u errors %u; %llu ms\n",
+ 	    sent, count, bytes, rx->eops, rx->frames, rx->bytes, late, rx->errors, gps_ms(start));
+ 	gps_print_text(rx);
++}
++
++/*
++ * herogps=3: runtime transport for the vendor lhd running under the Linux ABI
++ * layer (bsd/dev/herolte_linux.c maps the Linux paths here):
++ *   /dev/herobcm0  /dev/ttyBCM   raw SSI stream (Linux bcm_gps_spi.c, passthrough)
++ *   /dev/herobcm1  /dev/bbd_sensor  never has data (no sensor hub packets)
++ *   /dev/herobcm2  GPS_PWR_EN value: "1"/"0" power the chip and own the pins
++ * One kernel thread polls HOST_REQ and drains the write queue over GPIO SSI.
++ */
++#define HB_RX_SIZE 65536
++#define HB_TX_SIZE 16384
++
++static struct {
++	vm_offset_t map[5];
++	struct gps_pins power, req, resp, spi, host;
++	struct gps_bus bus;
++	bool mapped, powered, stop, running;
++	lck_mtx_t *lock;
++	uint8_t rx[HB_RX_SIZE];
++	unsigned rx_head, rx_tail, rx_dropped;
++	uint8_t tx[HB_TX_SIZE];
++	unsigned tx_len;
++	struct selinfo rsel;
++	uint64_t frames, rx_bytes, tx_bytes;
++} hb;
++static LCK_GRP_DECLARE(hb_lck_grp, "herolte_gps");
++static LCK_MTX_DECLARE(hb_mtx, &hb_lck_grp);
++
++static unsigned
++hb_rx_count(void)
++{
++	return (hb.rx_head - hb.rx_tail) % HB_RX_SIZE;
++}
++
++static void
++hb_rx_push(const uint8_t *data, unsigned len)
++{
++	lck_mtx_lock(&hb_mtx);
++	for (unsigned i = 0; i < len; i++) {
++		if (hb_rx_count() == HB_RX_SIZE - 1) {
++			hb.rx_dropped += len - i;
++			break;
++		}
++		hb.rx[hb.rx_head] = data[i];
++		hb.rx_head = (hb.rx_head + 1) % HB_RX_SIZE;
++	}
++	hb.rx_bytes += len;
++	lck_mtx_unlock(&hb_mtx);
++	selwakeup(&hb.rsel);
++	wakeup(&hb.rx);
++}
++
++/* One SSI read when HOST_REQ is up; false if the chip did not answer. */
++static bool
++hb_receive(void)
++{
++	uint8_t frame[2 + 254];
++	unsigned len;
++	if (!gps_wake(&hb.bus)) {
++		return false;
++	}
++	frame[0] = 0x20;
++	frame[1] = 0;
++	gps_transfer_fast(hb.bus.spi, frame, 2);
++	if (frame[0] != 0) {
++		gps_set(hb.bus.req, 1U << 4, 0);
++		return false;
++	}
++	len = frame[1] ? frame[1] : 254;
++	memset(frame, 0, sizeof(frame));
++	frame[0] = 0x20;
++	gps_transfer_fast(hb.bus.spi, frame, len + 2);
++	gps_set(hb.bus.req, 1U << 4, 0);
++	if (frame[0] != 0) {
++		return false;
++	}
++	if (frame[1] < len) {
++		len = frame[1];
++	}
++	hb.frames++;
++	hb_rx_push(frame + 2, len);
++	return true;
++}
++
++static void
++hb_send_pending(void)
++{
++	static uint8_t out[1 + 1024];
++	unsigned n;
++	lck_mtx_lock(&hb_mtx);
++	n = MIN(hb.tx_len, (unsigned)sizeof(out) - 1);
++	memcpy(out + 1, hb.tx, n);
++	memmove(hb.tx, hb.tx + n, hb.tx_len - n);
++	hb.tx_len -= n;
++	lck_mtx_unlock(&hb_mtx);
++	wakeup(&hb.tx_len);
++	if (!n) {
++		return;
++	}
++	out[0] = 0;                     /* SSI half-duplex write */
++	if (gps_wake(&hb.bus)) {
++		gps_transfer_fast(hb.bus.spi, out, n + 1);
++		gps_set(hb.bus.req, 1U << 4, 0);
++		hb.tx_bytes += n;
++	}
++}
++
++static void
++hb_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	unsigned errors = 0;
++	printf("HEROLTE GPS: transport thread up\n");
++	while (!hb.stop) {
++		bool busy = false;
++		if (gps_read(hb.bus.host) & (1U << 4)) {
++			if (!hb_receive() && ++errors < 8) {
++				printf("HEROLTE GPS: SSI read failed\n");
++			}
++			busy = true;
++		}
++		if (hb.tx_len) {
++			hb_send_pending();
++			busy = true;
++		}
++		if (!busy) {
++			assert_wait_timeout(&hb.tx, THREAD_UNINT, 1, 1000 * NSEC_PER_USEC);
++			thread_block(THREAD_CONTINUE_NULL);
++		}
++	}
++	printf("HEROLTE GPS: transport thread down (frames %llu rx %llu tx %llu dropped %u)\n",
++	    hb.frames, hb.rx_bytes, hb.tx_bytes, hb.rx_dropped);
++	hb.running = false;
++	wakeup(&hb.running);
++}
++
++static void
++hb_power(bool on)
++{
++	if (on == hb.powered || !hb.mapped) {
++		return;
++	}
++	if (on) {
++		gps_configure(&hb.host, 0, 0, 0x100);
++		gps_configure(&hb.resp, 0, 0, 0x30);
++		gps_configure(&hb.req, 0x10000, 0, 0);
++		gps_configure(&hb.spi, 0x10110000, CS | CLK, 0xdf00);
++		gps_configure(&hb.power, 0x10, 0, 0);
++		delay(21000);
++		gps_set(hb.power.bank + DAT, 2, 2);
++		delay(31000);
++		lck_mtx_lock(&hb_mtx);
++		hb.rx_head = hb.rx_tail = 0;
++		hb.tx_len = 0;
++		lck_mtx_unlock(&hb_mtx);
++		hb.stop = false;
++		hb.running = true;
++		hb.powered = true;
++		thread_t th;
++		if (kernel_thread_start(hb_thread, NULL, &th) == KERN_SUCCESS) {
++			thread_deallocate(th);
++		} else {
++			hb.running = false;
++		}
++		printf("HEROLTE GPS: power on, req/resp/host=%d/%d/%d\n", !!(gps_read(hb.bus.req) & 16),
++		    !!(gps_read(hb.bus.resp) & 4), !!(gps_read(hb.bus.host) & 16));
++	} else {
++		hb.stop = true;
++		wakeup(&hb.tx);
++		while (hb.running) {
++			tsleep(&hb.running, PWAIT, "hbstop", hz / 10);
++		}
++		gps_set(hb.power.bank + DAT, 2, 0);
++		gps_restore(&hb.power);
++		gps_restore(&hb.spi);
++		gps_restore(&hb.req);
++		gps_restore(&hb.resp);
++		gps_restore(&hb.host);
++		hb.powered = false;
++		printf("HEROLTE GPS: power off\n");
++	}
+ }
+ 
++static int
++hb_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++hb_read(dev_t dev, struct uio *uio, int ioflag)
++{
++	int error = 0;
++	if (minor(dev) == 2) {
++		char v[2] = { hb.powered ? '1' : '0', '\n' };
++		if (uio_offset(uio) >= 2) {
++			return 0;
++		}
++		return uiomove(v + uio_offset(uio), 2 - (int)uio_offset(uio), uio);
++	}
++	if (minor(dev) == 1) {
++		return (ioflag & IO_NDELAY) ? EWOULDBLOCK : tsleep(&hb.rsel, PCATCH | PWAIT, "bbdsens", 0);
++	}
++	lck_mtx_lock(&hb_mtx);
++	while (hb_rx_count() == 0) {
++		if (ioflag & IO_NDELAY) {
++			lck_mtx_unlock(&hb_mtx);
++			return EWOULDBLOCK;
++		}
++		error = msleep(&hb.rx, &hb_mtx, PCATCH | PWAIT, "ttybcm", NULL);
++		if (error) {
++			lck_mtx_unlock(&hb_mtx);
++			return error;
++		}
++	}
++	while (hb_rx_count() && uio_resid(uio) > 0 && !error) {
++		unsigned chunk = hb.rx_head >= hb.rx_tail ? hb.rx_head - hb.rx_tail : HB_RX_SIZE - hb.rx_tail;
++		chunk = MIN(chunk, (unsigned)uio_resid(uio));
++		error = uiomove((char *)hb.rx + hb.rx_tail, (int)chunk, uio);
++		hb.rx_tail = (hb.rx_tail + chunk) % HB_RX_SIZE;
++	}
++	lck_mtx_unlock(&hb_mtx);
++	return error;
++}
++
++static int
++hb_write(dev_t dev, struct uio *uio, int ioflag)
++{
++	int error = 0;
++	if (minor(dev) == 2) {
++		char c = 0;
++		if (uio_resid(uio) > 0) {
++			error = uiomove(&c, 1, uio);
++		}
++		uio_setresid(uio, 0);
++		if (!error && (c == '0' || c == '1')) {
++			hb_power(c == '1');
++		}
++		return error;
++	}
++	if (minor(dev) != 0) {
++		uio_setresid(uio, 0);
++		return 0;
++	}
++	if (!hb.powered) {
++		return EIO;
++	}
++	lck_mtx_lock(&hb_mtx);
++	while (uio_resid(uio) > 0 && !error) {
++		unsigned room = HB_TX_SIZE - hb.tx_len;
++		if (!room) {
++			if (ioflag & IO_NDELAY) {
++				error = EWOULDBLOCK;
++				break;
++			}
++			error = msleep(&hb.tx_len, &hb_mtx, PCATCH | PWAIT, "ttybcmw", NULL);
++			continue;
++		}
++		unsigned n = MIN(room, (unsigned)uio_resid(uio));
++		error = uiomove((char *)hb.tx + hb.tx_len, (int)n, uio);
++		if (!error) {
++			hb.tx_len += n;
++		}
++	}
++	lck_mtx_unlock(&hb_mtx);
++	wakeup(&hb.tx);
++	return error;
++}
++
++static int
++hb_select(dev_t dev, int which, void *wql, struct proc *p)
++{
++	if (which == FWRITE) {
++		return 1;
++	}
++	if (which == FREAD && minor(dev) == 0) {
++		int ready;
++		lck_mtx_lock(&hb_mtx);
++		ready = hb_rx_count() != 0;
++		if (!ready) {
++			selrecord(p, &hb.rsel, wql);
++		}
++		lck_mtx_unlock(&hb_mtx);
++		return ready;
++	}
++	if (which == FREAD && minor(dev) == 2) {
++		return 1;
++	}
++	return 0;
++}
++
++static int
++hb_ioctl(__unused dev_t dev, __unused u_long cmd, __unused caddr_t data, __unused int flag, __unused struct proc *p)
++{
++	return ENOTTY;
++}
++
++static const struct cdevsw hb_cdevsw = {
++	.d_open = hb_open, .d_close = hb_open, .d_read = hb_read, .d_write = hb_write,
++	.d_ioctl = hb_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = hb_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
++};
++
++static void
++hb_init(void)
++{
++	static const unsigned phys[] = {0x13610000, 0x14c80000, 0x136d0000, 0x14cc0000, 0x10580000};
++	int major;
++	for (unsigned i = 0; i < 5; i++) {
++		hb.map[i] = ml_io_map_unmappable(phys[i], 0x1000, VM_WIMG_IO);
++		if (!hb.map[i]) {
++			printf("HEROLTE GPS: MMIO map failed at %#x\n", phys[i]);
++			return;
++		}
++	}
++	gps_set(hb.map[0] + 0x800, 1U << 5, 1U << 5);
++	gps_set(hb.map[1] + 0x800, 1U << 8, 1U << 8);
++	if (!(gps_read(hb.map[0] + 0x800) & (1U << 5)) || !(gps_read(hb.map[1] + 0x800) & (1U << 8))) {
++		printf("HEROLTE GPS: GPIO bus clock disabled\n");
++		return;
++	}
++	hb.power = (struct gps_pins){ .bank = hb.map[2] + 0xa0, .con_mask = 0xf0, .dat_mask = 2, .pud_mask = 0xc };
++	hb.req = (struct gps_pins){ .bank = hb.map[3] + 0x40, .con_mask = 0xf0000, .dat_mask = 16, .pud_mask = 0x300 };
++	hb.resp = (struct gps_pins){ .bank = hb.map[3] + 0x140, .con_mask = 0xf00, .pud_mask = 0x30 };
++	hb.spi = (struct gps_pins){ .bank = hb.map[3] + 0xa0, .con_mask = 0xffff0000, .dat_mask = CLK | CS | MOSI, .pud_mask = 0xff00 };
++	hb.host = (struct gps_pins){ .bank = hb.map[4] + 0x60, .con_mask = 0xf0000, .pud_mask = 0x300 };
++	hb.bus = (struct gps_bus){ hb.spi.bank + DAT, hb.req.bank + DAT, hb.resp.bank + DAT, hb.host.bank + DAT };
++	hb.mapped = true;
++	major = cdevsw_add(-1, &hb_cdevsw);
++	for (int m = 0; major >= 0 && m < 3; m++) {
++		if (!devfs_make_node(makedev(major, m), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "herobcm%d", m)) {
++			major = -1;
++		}
++	}
++	printf("HEROLTE GPS: runtime transport %s (/dev/herobcm0-2)\n", major >= 0 ? "ready" : "FAILED");
++}
++
+ void
+ herolte_gps_probe(const uint8_t *blob, unsigned long size)
+ {
+@@ -433,9 +779,13 @@
+ 	vm_offset_t map[5];
+ 	unsigned count = 0;
+ 	int mode = 0;
+-	if (!PE_parse_boot_argn("herogps", &mode, sizeof(mode)) || (mode != 1 && mode != 2)) {
++	if (!PE_parse_boot_argn("herogps", &mode, sizeof(mode)) || (mode < 1 || mode > 3)) {
+ 		return;
+ 	}
++	if (mode == 3) {
++		hb_init();
++		return;
++	}
+ 	for (; count < 5; count++) {
+ 		map[count] = ml_io_map_unmappable(phys[count], 0x1000, VM_WIMG_IO);
+ 		if (!map[count]) {
