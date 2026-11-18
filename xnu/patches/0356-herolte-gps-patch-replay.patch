@@ -1,0 +1,337 @@
+diff --git a/bsd/dev/herolte_gps.c b/bsd/dev/herolte_gps.c
+--- a/bsd/dev/herolte_gps.c
++++ b/bsd/dev/herolte_gps.c
+@@ -11,7 +11,7 @@
+ 
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, unsigned int);
+ extern void ml_io_unmap(vm_offset_t, vm_size_t);
+-void herolte_gps_probe(void);
++void herolte_gps_probe(const uint8_t *blob, unsigned long size);
+ 
+ enum { CON = 0, DAT = 4, PUD = 8 };
+ enum { CLK = 1U << 4, CS = 1U << 5, MISO = 1U << 6, MOSI = 1U << 7 };
+@@ -83,6 +83,34 @@
+ 	gps_set(spi, CS, CS);
+ }
+ 
++/* Same mode 3 wire protocol without the 2 us half periods, for the patch
++ * download (Linux drives this bus at up to 26 MHz). The DAT value is read
++ * once; only CLK/MOSI/CS change while the bank is owned by this probe. */
++static void
++gps_transfer_fast(vm_offset_t spi, uint8_t *bytes, unsigned count)
++{
++	volatile uint32_t *dat = (volatile uint32_t *)spi;
++	uint32_t base = gps_read(spi) & ~(CLK | MOSI | CS);
++	*dat = base | CLK;
++	__asm__ volatile ("dsb osh" ::: "memory");
++	delay(1);
++	for (unsigned i = 0; i < count; i++) {
++		uint8_t tx = bytes[i], rx = 0;
++		for (unsigned bit = 0; bit < 8; bit++) {
++			uint32_t mosi = (tx & 0x80) ? MOSI : 0;
++			*dat = base | mosi;
++			__asm__ volatile ("dsb osh" ::: "memory");
++			*dat = base | mosi | CLK;
++			__asm__ volatile ("dsb osh" ::: "memory");
++			rx = (uint8_t)((rx << 1) | !!(gps_read(spi) & MISO));
++			tx = (uint8_t)(tx << 1);
++		}
++		bytes[i] = rx;
++	}
++	*dat = base | CLK | CS;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
+ static bool
+ gps_wake(const struct gps_bus *bus)
+ {
+@@ -170,18 +198,242 @@
+ 		    !memcmp(payload + 2, expected, sizeof(expected)) ? "matches" : "differs from");
+ 		printf("HEROLTE GPS: reply %s\n", got);
+ 		printf("HEROLTE GPS: diff  %s\n", diff);
++	}
++}
++
++
++/* Replay of lhd's recovery-mode patch download (see mkreplay.py in the
++ * private bring-up notes). Each record is one lhd ttyBCM write() and the
++ * number of chip end-of-packet markers lhd had seen before it. */
++struct gps_rx {
++	unsigned eops, frames, bytes, errors;
++	uint8_t prev;
++	bool collect;
++	unsigned text_len;
++	uint8_t text[3072];
++};
++
++static struct gps_rx gps_rx_state;
++static uint8_t gps_tx_buf[1 + 1024];
++
++static uint64_t
++gps_ms(uint64_t start)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
++	return ns / 1000000;
++}
++
++/* 1 = frame read, 0 = HOST_REQ low, -1 = transport error. */
++static int
++gps_receive(const struct gps_bus *bus, struct gps_rx *rx)
++{
++	uint8_t frame[2 + 254];
++	unsigned len;
++	if (!(gps_read(bus->host) & (1U << 4))) {
++		return 0;
++	}
++	if (!gps_wake(bus)) {
++		rx->errors++;
++		return -1;
++	}
++	frame[0] = 0x20;
++	frame[1] = 0;
++	gps_transfer_fast(bus->spi, frame, 2);
++	if (frame[0] != 0) {
++		gps_set(bus->req, 1U << 4, 0);
++		rx->errors++;
++		return -1;
++	}
++	len = frame[1] ? frame[1] : 254;
++	if (len > 254) {
++		len = 254;
++	}
++	memset(frame, 0, sizeof(frame));
++	frame[0] = 0x20;
++	gps_transfer_fast(bus->spi, frame, len + 2);
++	gps_set(bus->req, 1U << 4, 0);
++	if (frame[0] != 0) {
++		rx->errors++;
++		return -1;
++	}
++	if (frame[1] < len) {
++		len = frame[1];
++	}
++	rx->frames++;
++	rx->bytes += len;
++	for (unsigned i = 0; i < len; i++) {
++		uint8_t b = frame[2 + i];
++		if (rx->prev == 0xb0 && b == 0x01) {
++			rx->eops++;
++		}
++		rx->prev = b;
++		if (rx->collect && rx->text_len < sizeof(rx->text)) {
++			rx->text[rx->text_len++] = b;
++		}
++	}
++	return 1;
++}
++
++static bool
++gps_text_has(const struct gps_rx *rx, const char *needle)
++{
++	unsigned n = (unsigned)strlen(needle);
++	for (unsigned i = 0; i + n <= rx->text_len; i++) {
++		if (!memcmp(rx->text + i, needle, n)) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* Poll the chip for ms milliseconds (or until stop() is satisfied). */
++static int
++gps_drain(const struct gps_bus *bus, struct gps_rx *rx, unsigned ms, const char *stop)
++{
++	uint64_t start = mach_absolute_time();
++	while (gps_ms(start) < ms) {
++		int r = gps_receive(bus, rx);
++		if (r < 0 && rx->errors > 8) {
++			return -1;
++		}
++		if (stop && gps_text_has(rx, stop)) {
++			return 1;
++		}
++		if (r == 0) {
++			delay(200);
++		}
+ 	}
++	return 0;
+ }
+ 
++static void
++gps_print_text(const struct gps_rx *rx)
++{
++	unsigned lines = 0;
++	for (unsigned i = 0; i < rx->text_len && lines < 16;) {
++		unsigned j = i;
++		while (j < rx->text_len && rx->text[j] >= 0x20 && rx->text[j] < 0x7f) {
++			j++;
++		}
++		if (j - i >= 6) {
++			char line[121];
++			unsigned n = j - i < 120 ? j - i : 120;
++			memcpy(line, rx->text + i, n);
++			line[n] = 0;
++			printf("HEROLTE GPS: chip text \"%s\"\n", line);
++			lines++;
++		}
++		i = j + 1;
++	}
++}
++
++static uint16_t
++gps_le16(const uint8_t *p)
++{
++	return (uint16_t)(p[0] | (p[1] << 8));
++}
++
++static void
++gps_replay(const struct gps_bus *bus, const uint8_t *blob, unsigned long size)
++{
++	struct gps_rx *rx = &gps_rx_state;
++	unsigned count, total_bytes, sent = 0, late = 0;
++	unsigned long off = 16, bytes = 0;
++	uint64_t start = mach_absolute_time();
++	int result;
++	if (size < 16 || memcmp(blob, "HGPSRPL1", 8)) {
++		printf("HEROLTE GPS: replay blob missing or bad magic (%lu bytes)\n", size);
++		return;
++	}
++	count = blob[8] | (blob[9] << 8) | (blob[10] << 16) | ((unsigned)blob[11] << 24);
++	total_bytes = blob[12] | (blob[13] << 8) | (blob[14] << 16) | ((unsigned)blob[15] << 24);
++	memset(rx, 0, sizeof(*rx));
++	printf("HEROLTE GPS: replay %u records, %u bytes\n", count, total_bytes);
++	for (unsigned i = 0; i < count; i++) {
++		unsigned wait, pause, len;
++		const uint8_t *data;
++		uint64_t wait_start;
++		if (off + 6 > size) {
++			printf("HEROLTE GPS: replay record %u header past blob end\n", i);
++			goto done;
++		}
++		wait = gps_le16(blob + off);
++		pause = gps_le16(blob + off + 2);
++		len = gps_le16(blob + off + 4);
++		data = blob + off + 6;
++		off += 6 + len;
++		if (off > size) {
++			printf("HEROLTE GPS: replay record %u data past blob end\n", i);
++			goto done;
++		}
++		if (i + 2 == count) {
++			rx->collect = true;
++		}
++		if (pause && gps_drain(bus, rx, pause, NULL) < 0) {
++			printf("HEROLTE GPS: replay transport errors before record %u\n", i);
++			goto done;
++		}
++		wait_start = mach_absolute_time();
++		while (rx->eops < wait) {
++			int r = gps_receive(bus, rx);
++			if (r < 0 && rx->errors > 8) {
++				printf("HEROLTE GPS: replay transport errors at record %u\n", i);
++				goto done;
++			}
++			if (r == 0) {
++				if (gps_ms(wait_start) > 300) {
++					late++;
++					break;
++				}
++				delay(50);
++			}
++		}
++		if (late > 16) {
++			printf("HEROLTE GPS: replay stalled at record %u (chip packets %u, wanted %u)\n",
++			    i, rx->eops, wait);
++			goto done;
++		}
++		for (unsigned done_len = 0; done_len < len;) {
++			unsigned n = len - done_len;
++			if (n > sizeof(gps_tx_buf) - 1) {
++				n = sizeof(gps_tx_buf) - 1;
++			}
++			gps_tx_buf[0] = 0;
++			memcpy(gps_tx_buf + 1, data + done_len, n);
++			if (!gps_wake(bus)) {
++				printf("HEROLTE GPS: replay wake failed at record %u\n", i);
++				goto done;
++			}
++			gps_transfer_fast(bus->spi, gps_tx_buf, n + 1);
++			gps_set(bus->req, 1U << 4, 0);
++			done_len += n;
++		}
++		bytes += len;
++		sent++;
++		if ((i & 127) == 127) {
++			printf("HEROLTE GPS: replay %u/%u records, chip packets %u, %llu ms\n",
++			    sent, count, rx->eops, gps_ms(start));
++		}
++	}
++	result = gps_drain(bus, rx, 3000, "Waiting for Host");
++	printf("HEROLTE GPS: patch %s\n", result > 0 ? "running, host connect requested" :
++	    (gps_text_has(rx, "CohoSwordtailPatch") ? "version reported" : "no version text"));
++done:
++	printf("HEROLTE GPS: replay sent %u/%u records %lu bytes; chip packets %u frames %u bytes %u; late %u errors %u; %llu ms\n",
++	    sent, count, bytes, rx->eops, rx->frames, rx->bytes, late, rx->errors, gps_ms(start));
++	gps_print_text(rx);
++}
++
+ void
+-herolte_gps_probe(void)
++herolte_gps_probe(const uint8_t *blob, unsigned long size)
+ {
+ 	/* CMU_PERIC0/1, GPIO_PERIC0/1 and ALIVE. Only GPIO bus clocks needed. */
+ 	static const unsigned phys[] = {0x13610000,0x14c80000,0x136d0000,0x14cc0000,0x10580000};
+ 	vm_offset_t map[5];
+ 	unsigned count = 0;
+ 	int mode = 0;
+-	if (!PE_parse_boot_argn("herogps", &mode, sizeof(mode)) || mode != 1) {
++	if (!PE_parse_boot_argn("herogps", &mode, sizeof(mode)) || (mode != 1 && mode != 2)) {
+ 		return;
+ 	}
+ 	for (; count < 5; count++) {
+@@ -220,7 +472,11 @@
+ 	printf("HEROLTE GPS: cold bootstrap power/req/resp/host=%u/%u/%u/%u\n",
+ 	    !!(gps_read(power.bank+DAT)&2), !!(gps_read(bus.req)&16),
+ 	    !!(gps_read(bus.resp)&4), !!(gps_read(bus.host)&16));
+-	gps_bootstrap(&bus);
++	if (mode == 2) {
++		gps_replay(&bus, blob, size);
++	} else {
++		gps_bootstrap(&bus);
++	}
+ 	gps_set(power.bank + DAT, 2, 0);
+ 	gps_restore(&power);
+ 	gps_restore(&spi);
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -778,9 +778,25 @@
+ 	/* sec_ts on the Exynos 8890 HSI2C (bsd/dev/herolte_touch.c). */
+ 	extern void herolte_touch_probe(void);
+ 	herolte_touch_probe();
+-	/* Sample GPS before the audio worker starts using the adjacent GPE6 pin. */
+-	extern void herolte_gps_probe(void);
+-	herolte_gps_probe();
++	/* Sample GPS before the audio worker starts using the adjacent GPE6 pin.
++	 * An optional patch-download replay arrives like the RAMDisk, as
++	 * /chosen/memory-map "HeroGPS" = <phys, size> (tools/mkpayload.py). */
++	{
++	extern void herolte_gps_probe(const uint8_t *blob, unsigned long size);
++	const uint8_t *gpsBlob = NULL;
++	unsigned long gpsSize = 0;
++	IORegistryEntry *gpsMap = IORegistryEntry::fromPath( "/chosen/memory-map", gIODTPlane );
++	if (gpsMap) {
++		OSData *gpsData = OSDynamicCast(OSData, gpsMap->getProperty("HeroGPS"));
++		if (gpsData && gpsData->getLength() == 2 * sizeof(uintptr_t)) {
++			const uintptr_t *gpsParms = (const uintptr_t *)gpsData->getBytesNoCopy();
++			gpsBlob = (const uint8_t *)ml_static_ptovirt(gpsParms[0]);
++			gpsSize = gpsParms[1];
++		}
++		gpsMap->release();
++	}
++	herolte_gps_probe(gpsBlob, gpsSize);
++	}
+ 	/* Mali-T880 read-only probe (bsd/dev/herolte_gpu.c). */
+ 	extern void herolte_gpu_probe(void);
+ 	herolte_gpu_probe();
