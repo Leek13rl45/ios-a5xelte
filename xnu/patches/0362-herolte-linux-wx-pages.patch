@@ -1,0 +1,90 @@
+diff --git a/osfmk/vm/vm_map.c b/osfmk/vm/vm_map.c
+--- a/osfmk/vm/vm_map.c
++++ b/osfmk/vm/vm_map.c
+@@ -5786,6 +5786,10 @@
+  *	specified, the maximum protection is to be set;
+  *	otherwise, only the current protection is affected.
+  */
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++extern bool herolte_linux_allow_wx(void);
++#endif
++
+ kern_return_t
+ vm_map_protect(
+ 	vm_map_t        map,
+@@ -5969,6 +5973,10 @@
+ #endif /* XNU_TARGET_OS_OSX */
+ #if CODE_SIGNING_MONITOR
+ 		    (csm_address_space_exempt(map->pmap) != KERN_SUCCESS) &&
++#endif
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++		    /* Linux ELF pages share 16K map pages (bsd/dev/herolte_linux.c) */
++		    !herolte_linux_allow_wx() &&
+ #endif
+ 		    !(current->used_for_jit)) {
+ 			DTRACE_VM3(cs_wx,
+diff --git a/bsd/dev/herolte_linux.c b/bsd/dev/herolte_linux.c
+--- a/bsd/dev/herolte_linux.c
++++ b/bsd/dev/herolte_linux.c
+@@ -710,6 +710,23 @@
+  * Partial-page protection changes widen to RWX and PROT_NONE is ignored.
+  */
+ #define LX_RWX (PROT_READ | PROT_WRITE | PROT_EXEC)
++
++/*
++ * vm_map_protect() strips exec from write+exec requests on iOS. Linux ELF
++ * code and data share 16K map pages, so the loader process (named linuxrun,
++ * which stays its name after linux_enter) may hold RWX pages.
++ */
++bool herolte_linux_allow_wx(void);
++bool
++herolte_linux_allow_wx(void)
++{
++	proc_t p = current_proc();
++	if (lx_enabled < 0) {
++		int enabled = 0;
++		lx_enabled = PE_parse_boot_argn("linuxabi", &enabled, sizeof(enabled)) && enabled == 1;
++	}
++	return lx_enabled && p != NULL && strncmp(p->p_comm, "linuxrun", sizeof(p->p_comm)) == 0;
++}
+ 
+ static uint64_t
+ lx_pagemask(void)
+@@ -726,7 +743,7 @@
+ 		int32_t r;
+ 		if (mprotect(p, &ma, &r) != 0) {
+ 			struct mmap_args mm = {
+-				.addr = a, .len = psize, .prot = LX_RWX,
++				.addr = a, .len = psize, .prot = PROT_READ | PROT_WRITE,
+ 				.flags = MAP_ANON | MAP_PRIVATE | MAP_FIXED, .fd = -1, .pos = 0,
+ 			};
+ 			user_addr_t got = 0;
+@@ -734,6 +751,9 @@
+ 			if (error) {
+ 				return error;
+ 			}
++			if ((error = mprotect(p, &ma, &r)) != 0) {
++				return error;
++			}
+ 		}
+ 	}
+ 	return 0;
+@@ -776,11 +796,17 @@
+ 	int error;
+ 	if (!fixed) {
+ 		struct mmap_args mm = {
+-			.addr = 0, .len = (len + pmask) & ~pmask, .prot = LX_RWX,
++			.addr = 0, .len = (len + pmask) & ~pmask, .prot = PROT_READ | PROT_WRITE,
+ 			.flags = MAP_ANON | MAP_PRIVATE, .fd = -1, .pos = 0,
+ 		};
++		struct mprotect_args mp;
++		int32_t r;
+ 		error = mmap(p, &mm, &base);
+ 		if (error) {
++			return -lx_errno(error);
++		}
++		mp = (struct mprotect_args){ .addr = base, .len = mm.len, .prot = LX_RWX };
++		if ((error = mprotect(p, &mp, &r)) != 0) {
+ 			return -lx_errno(error);
+ 		}
+ 	} else {
