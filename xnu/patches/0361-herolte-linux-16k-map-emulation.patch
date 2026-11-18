@@ -1,0 +1,170 @@
+diff --git a/bsd/dev/herolte_linux.c b/bsd/dev/herolte_linux.c
+--- a/bsd/dev/herolte_linux.c
++++ b/bsd/dev/herolte_linux.c
+@@ -45,6 +45,8 @@
+ #include <sys/filio.h>
+ #include <sys/wait.h>
+ #include <libkern/OSAtomic.h>
++#include <vm/vm_map.h>
++#include <vm/vm_kern.h>
+ 
+ #define LX_ROOT "/private/var/herolte/linux/root"
+ 
+@@ -698,9 +700,106 @@
+ 		done += n;
+ 	}
+ 	return (int64_t)len;
++}
++
++/*
++ * iOS maps are 16K-page on this kernel (VM page 16K, >1 GB RAM) while Linux
++ * ELF objects and bionic's linker work in 4K pages. Requests that are not
++ * aligned to the map page are emulated: the covering map pages are made
++ * RWX (contents kept) and the 4K range is filled by copy (file) or zeroing.
++ * Partial-page protection changes widen to RWX and PROT_NONE is ignored.
++ */
++#define LX_RWX (PROT_READ | PROT_WRITE | PROT_EXEC)
++
++static uint64_t
++lx_pagemask(void)
++{
++	return vm_map_page_mask(current_map());
++}
++
++static int
++lx_open_pages(proc_t p, user_addr_t start, user_addr_t end)
++{
++	uint64_t psize = lx_pagemask() + 1;
++	for (user_addr_t a = start; a < end; a += psize) {
++		struct mprotect_args ma = { .addr = a, .len = psize, .prot = LX_RWX };
++		int32_t r;
++		if (mprotect(p, &ma, &r) != 0) {
++			struct mmap_args mm = {
++				.addr = a, .len = psize, .prot = LX_RWX,
++				.flags = MAP_ANON | MAP_PRIVATE | MAP_FIXED, .fd = -1, .pos = 0,
++			};
++			user_addr_t got = 0;
++			int error = mmap(p, &mm, &got);
++			if (error) {
++				return error;
++			}
++		}
++	}
++	return 0;
++}
++
++static int
++lx_fill(proc_t p, user_addr_t addr, uint64_t len, int fd, uint64_t off, bool anon)
++{
++	static const uint8_t zero[4096];
++	uint64_t done = 0;
++	while (done < len) {
++		uint64_t n = len - done;
++		if (anon) {
++			n = MIN(n, sizeof(zero));
++			if (copyout(zero, addr + done, n)) {
++				return EFAULT;
++			}
++		} else {
++			struct pread_args pa = { .fd = fd, .buf = addr + done, .nbyte = n, .offset = (off_t)(off + done) };
++			user_ssize_t got = 0;
++			int error = pread(p, &pa, &got);
++			if (error) {
++				return error;
++			}
++			if (got <= 0) {                 /* past EOF: Linux gives zeroes */
++				return lx_fill(p, addr + done, len - done, -1, 0, true);
++			}
++			n = (uint64_t)got;
++		}
++		done += n;
++	}
++	return 0;
+ }
+ 
+ static int64_t
++lx_mmap_emulated(proc_t p, uint64_t addr, uint64_t len, bool fixed, int fd, uint64_t off, bool anon)
++{
++	uint64_t pmask = lx_pagemask();
++	user_addr_t base = addr;
++	int error;
++	if (!fixed) {
++		struct mmap_args mm = {
++			.addr = 0, .len = (len + pmask) & ~pmask, .prot = LX_RWX,
++			.flags = MAP_ANON | MAP_PRIVATE, .fd = -1, .pos = 0,
++		};
++		error = mmap(p, &mm, &base);
++		if (error) {
++			return -lx_errno(error);
++		}
++	} else {
++		error = lx_open_pages(p, addr & ~pmask, (addr + len + pmask) & ~pmask);
++		if (error) {
++			return -lx_errno(error);
++		}
++	}
++	error = lx_fill(p, base, len, fd, off, anon);
++	if (error) {
++		return -lx_errno(error);
++	}
++	if (lx_trace >= 2) {
++		LXLOG("mmap emulated %#llx+%#llx fd %d off %#llx", base, len, anon ? -1 : fd, off);
++	}
++	return (int64_t)base;
++}
++
++static int64_t
+ lx_mmap(proc_t p, uint64_t addr, uint64_t len, int prot, uint64_t lflags, int fd, uint64_t off)
+ {
+ 	struct mmap_args ma = {};
+@@ -721,6 +820,19 @@
+ 		flags |= MAP_ANON;
+ 		fd = -1;
+ 	}
++	{
++		uint64_t pmask = lx_pagemask();
++		bool anon = (flags & MAP_ANON) != 0;
++		bool fixed = (flags & MAP_FIXED) != 0;
++		bool aligned = (!fixed || ((addr & pmask) == 0 && (len & pmask) == 0)) &&
++		    (anon || (off & pmask) == 0);
++		if (len == 0) {
++			return -LX_EINVAL;
++		}
++		if (!aligned && !(flags & MAP_SHARED)) {
++			return lx_mmap_emulated(p, addr, len, fixed, fd, off, anon);
++		}
++	}
+ 	ma.addr = addr;
+ 	ma.len = len;
+ 	ma.prot = prot & (PROT_READ | PROT_WRITE | PROT_EXEC);
+@@ -1054,7 +1166,12 @@
+ 	case 178:                                       /* gettid */
+ 		return lt->tid;
+ 	case 215: {                                     /* munmap */
+-		struct munmap_args mu = { .addr = a[0], .len = a[1] };
++		uint64_t pm = lx_pagemask();
++		uint64_t s0 = (a[0] + pm) & ~pm, e0 = (a[0] + a[1]) & ~pm;
++		struct munmap_args mu = { .addr = s0, .len = e0 > s0 ? e0 - s0 : 0 };
++		if (mu.len == 0) {
++			return 0;                       /* only partial map pages */
++		}
+ 		error = munmap(p, &mu, &ival);
+ 		return error ? -lx_errno(error) : 0;
+ 	}
+@@ -1063,7 +1180,16 @@
+ 	case 222:                                       /* mmap */
+ 		return lx_mmap(p, a[0], a[1], (int)a[2], a[3], (int)a[4], a[5]);
+ 	case 226: {                                     /* mprotect */
++		uint64_t pm = lx_pagemask();
+ 		struct mprotect_args ma = { .addr = a[0], .len = a[1], .prot = (int)a[2] & 7 };
++		if ((a[0] & pm) || (a[1] & pm)) {
++			if (ma.prot == 0) {
++				return 0;               /* cannot drop a shared map page */
++			}
++			ma.addr = a[0] & ~pm;
++			ma.len = ((a[0] + a[1] + pm) & ~pm) - ma.addr;
++			ma.prot = LX_RWX;
++		}
+ 		error = mprotect(p, &ma, &ival);
+ 		return error ? -lx_errno(error) : 0;
+ 	}
