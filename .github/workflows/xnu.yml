@@ -165,7 +165,8 @@ jobs:
           # kernel change is a local recompile of the touched files plus a relink
           # instead of a full CI build.
           (cd dxb && find build/xnu.obj \( -name '*.o' -o -name '*.cpo' -o -name '*.a' \
-            -o -name '*.filelist' -o -name '*.exp' -o -name 'lastkernel*' \) -print) > objects.list
+            -o -name '*.filelist' -o -name '*.exp' -o -name 'lastkernel*' \) -print
+            find fakeroot/usr/local/lib/kernel -type f -print 2>/dev/null) > objects.list
           tar czf objects.tgz -C dxb -T objects.list
           ls -la objects.tgz
 
