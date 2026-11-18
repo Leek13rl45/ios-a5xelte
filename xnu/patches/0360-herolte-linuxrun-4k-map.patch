@@ -1,0 +1,21 @@
+diff --git a/bsd/kern/mach_loader.c b/bsd/kern/mach_loader.c
+--- a/bsd/kern/mach_loader.c
++++ b/bsd/kern/mach_loader.c
+@@ -509,6 +509,17 @@
+ 
+ #if defined(__arm64__)
+ 	if (result->is_64bit_addr) {
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++		/*
++		 * HEROLTE Linux ABI loader (bsd/dev/herolte_linux.c): Android ELF
++		 * objects are 4K aligned, and this kernel's pages are 4K, so give the
++		 * loader its native 4K map instead of the iOS 16K alignment.
++		 */
++		if (PAGE_SHIFT == FOURK_PAGE_SHIFT && vp->v_name != NULL &&
++		    strcmp(vp->v_name, "linuxrun") == 0) {
++			printf("LINUXABI: 4K map for %s\n", vp->v_name);
++		} else
++#endif
+ 		/* enforce 16KB alignment of VM map entries */
+ 		vm_map_set_page_shift(map, SIXTEENK_PAGE_SHIFT);
+ 	} else {
