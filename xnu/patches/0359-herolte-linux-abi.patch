@@ -1,0 +1,1447 @@
+diff --git a/osfmk/arm/thread.h b/osfmk/arm/thread.h
+--- a/osfmk/arm/thread.h
++++ b/osfmk/arm/thread.h
+@@ -119,6 +119,18 @@
+ 	struct perfcontrol_state  perfctrl_state;
+ 	uint64_t                  reserved5;
+ 
++	/* HEROLTE Linux arm64 ABI (bsd/dev/herolte_linux.c). linux_abi != 0 routes
++	 * svc to the Linux table and keeps the thread's own TPIDR_EL0 (linux_tls)
++	 * instead of the CPU number Darwin userspace expects there. */
++	struct herolte_linux_thread {
++		uint64_t          abi;
++		uint64_t          tls;
++		uint64_t          clear_tid;
++		uint64_t          robust_list;
++		int32_t           tid;
++		int32_t           nr;
++	}                         linux;
++
+ #if SCHED_HYGIENE_DEBUG
+ 	/*
+ 	 * Preemption disable timestamp, adjusted to
+diff --git a/osfmk/arm64/genassym.c b/osfmk/arm64/genassym.c
+--- a/osfmk/arm64/genassym.c
++++ b/osfmk/arm64/genassym.c
+@@ -130,6 +130,8 @@
+ 	/* These fields are being added on demand */
+ 	DECLARE("ACT_CONTEXT", offsetof(struct thread, machine.contextData));
+ 	DECLARE("TH_CTH_SELF", offsetof(struct thread, machine.cthread_self));
++	DECLARE("TH_LINUX_ABI", offsetof(struct thread, machine.linux.abi));
++	DECLARE("TH_LINUX_TLS", offsetof(struct thread, machine.linux.tls));
+ 	DECLARE("ACT_PREEMPT_CNT", offsetof(struct thread, machine.preemption_count));
+ #if SCHED_HYGIENE_DEBUG
+ 	DECLARE("SCHED_HYGIENE_MARKER", SCHED_HYGIENE_MARKER);
+diff --git a/osfmk/arm64/cswitch.s b/osfmk/arm64/cswitch.s
+--- a/osfmk/arm64/cswitch.s
++++ b/osfmk/arm64/cswitch.s
+@@ -180,6 +180,10 @@
+ 	str		$0, [$1, CPU_ACTIVE_THREAD]
+ 
+ 	ldrsh	$2, [$1, CPU_NUMBER_GS]
++	ldr		$1, [$0, TH_LINUX_ABI]				// HEROLTE Linux ABI thread?
++	cmp		$1, #0
++	ldr		$1, [$0, TH_LINUX_TLS]
++	csel	$2, $2, $1, eq						// Linux: its own TPIDR_EL0
+ 	msr		TPIDR_EL0, $2
+ 
+ 	ldr		$1, [$0, TH_CTH_SELF]				// Get cthread pointer
+@@ -333,6 +337,11 @@
+ 	ldr		x3, [x0, TH_KSTACKPTR]				// Get the old kernel stack top
+ 	save_general_registers	x3, 4
+ Lswitch_threads:
++	ldr		x3, [x0, TH_LINUX_ABI]				// Save a Linux thread's TPIDR_EL0
++	cbz		x3, Lswitch_no_linux_tls
++	mrs		x4, TPIDR_EL0
++	str		x4, [x0, TH_LINUX_TLS]
++Lswitch_no_linux_tls:
+ 	set_thread_registers	x2, x3, x4
+ 	ldr		x3, [x2, TH_KSTACKPTR]
+ 	load_general_registers	x3, 4
+diff --git a/osfmk/arm64/locore.s b/osfmk/arm64/locore.s
+--- a/osfmk/arm64/locore.s
++++ b/osfmk/arm64/locore.s
+@@ -946,8 +946,11 @@
+ 	mrs		x3, TPIDR_EL1						// Reload thread pointer
+ 	ldr		x4, [x3, ACT_CPUDATAP]				// Reload CPU data pointer
+ L_skip_user_set_debug_state:
++	ldr		x0, [x3, TH_LINUX_ABI]				// HEROLTE Linux ABI: TPIDR_EL0 is the
++	cbnz	x0, L_skip_user_cpu_tpidr			// thread's TLS pointer, not the CPU
+ 	ldrsh	x0, [x4, CPU_NUMBER_GS]
+ 	msr		TPIDR_EL0, x0
++L_skip_user_cpu_tpidr:
+ 
+ 
+ 	b		exception_return_unint_tpidr_x3
+diff --git a/osfmk/arm64/pcb.c b/osfmk/arm64/pcb.c
+--- a/osfmk/arm64/pcb.c
++++ b/osfmk/arm64/pcb.c
+@@ -535,6 +535,9 @@
+ 
+ 	machine_switch_pmap_and_extended_context(old, new);
+ 
++	if (old->machine.linux.abi) {
++		old->machine.linux.tls = __builtin_arm_rsr64("TPIDR_EL0");
++	}
+ 	machine_set_current_thread(new);
+ 	thread_initialize_kernel_state(new);
+ }
+@@ -1146,3 +1149,14 @@
+ 	return FALSE;
+ }
+ #endif /* __has_feature(ptrauth_calls) */
++
++/* HEROLTE Linux arm64 ABI: struct thread is opaque to BSD code, so
++ * bsd/dev/herolte_linux.c reaches the per-thread Linux state through this. */
++void *herolte_linux_thread(thread_t thread);
++const size_t herolte_linux_thread_size = sizeof(struct herolte_linux_thread);
++
++void *
++herolte_linux_thread(thread_t thread)
++{
++	return &thread->machine.linux;
++}
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1666,6 +1666,15 @@
+ 
+ 	thread->iotier_override = THROTTLE_LEVEL_NONE; /* Reset IO tier override before handling SVC from userspace */
+ 
++	if (__improbable(thread->machine.linux.abi)) {
++		/* HEROLTE Linux arm64 ABI: number in x8, see bsd/dev/herolte_linux.c. */
++		extern void herolte_linux_syscall(arm_saved_state_t *, thread_t, struct proc *);
++		mach_kauth_cred_thread_update();
++		thread->syscalls_unix++;
++		herolte_linux_syscall(state, thread, get_bsdthreadtask_info(thread));
++		return;
++	}
++
+ 	if (trap_no == (int)PLATFORM_SYSCALL_TRAP_NO) {
+ 		platform_syscall(state);
+ 		panic("Returned from platform_syscall()?");
+diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -227,6 +227,8 @@
+ 	uthread_assert_zero_proc_refcount(uthread);
+ }
+ 
++extern void *herolte_linux_thread(thread_t);
++
+ void
+ unix_syscall_return(int error)
+ {
+@@ -241,6 +243,10 @@
+ 	                                         * n: " x) */
+ 
+ 	thread_act = current_thread();
++	if (__improbable(*(const uint64_t *)herolte_linux_thread(thread_act) != 0)) {
++		extern void herolte_linux_syscall_return(int) __dead2;
++		herolte_linux_syscall_return(error);
++	}
+ 	proc = current_proc();
+ 	uthread = get_bsdthread_info(thread_act);
+ 
+diff --git a/bsd/kern/syscalls.master b/bsd/kern/syscalls.master
+--- a/bsd/kern/syscalls.master
++++ b/bsd/kern/syscalls.master
+@@ -869,3 +869,4 @@
+ 553 AUE_MKFIFOAT	ALL	{ int mkfifoat(int fd, user_addr_t path, int mode); }
+ 554 AUE_MKNODAT	ALL	{ int mknodat(int fd, user_addr_t path, int mode, int dev); }
+ 555 AUE_NULL	ALL { int ungraftdmg(const char *mountdir, uint64_t flags); }
++556	AUE_NULL	ALL	{ int linux_enter(user_addr_t pc, user_addr_t sp, user_addr_t exe) NO_SYSCALL_STUB; }
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -118,6 +118,7 @@
+ bsd/dev/herolte_gl.c			standard
+ bsd/dev/herolte_rcam.c			standard
+ bsd/dev/herolte_gps.c			standard
++bsd/dev/herolte_linux.c			standard
+ bsd/dev/a5xelte_keys.c			standard
+ bsd/dev/a5xelte_touch.c			standard
+ bsd/dev/sweet_sample.c			standard
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -14576,6 +14576,74 @@
+ 	default:
+ 		error = ENOSYS;
+ 	}
++
++	return error;
++}
++
++/*
++ * HEROLTE Linux arm64 ABI (bsd/dev/herolte_linux.c): the same lookups as the
++ * *at() system calls, but with paths that the Linux layer has already copied
++ * in and rewritten under its root prefix (kernel address space).
++ */
++int herolte_linux_openat(vfs_context_t ctx, int fd, const char *kpath, int flags, int mode, int *retval);
++int herolte_linux_faccessat(vfs_context_t ctx, int fd, const char *kpath, int amode);
++int herolte_linux_readlinkat(vfs_context_t ctx, int fd, const char *kpath, user_addr_t buf, size_t bufsize, int *retval);
++int herolte_linux_statat(vfs_context_t ctx, int fd, const char *kpath, int follow, struct stat64 *sb);
++int herolte_linux_mkdirat(vfs_context_t ctx, int fd, const char *kpath, int mode);
++int herolte_linux_unlinkat(vfs_context_t ctx, int fd, const char *kpath, int rmdir);
++
++int
++herolte_linux_openat(vfs_context_t ctx, int fd, const char *kpath, int flags, int mode, int *retval)
++{
++	return openat_internal(ctx, CAST_USER_ADDR_T(kpath), flags, mode, fd, UIO_SYSSPACE, retval);
++}
++
++int
++herolte_linux_faccessat(vfs_context_t ctx, int fd, const char *kpath, int amode)
++{
++	return faccessat_internal(ctx, fd, CAST_USER_ADDR_T(kpath), amode, 0, UIO_SYSSPACE);
++}
++
++int
++herolte_linux_readlinkat(vfs_context_t ctx, int fd, const char *kpath, user_addr_t buf, size_t bufsize, int *retval)
++{
++	return readlinkat_internal(ctx, fd, NULLVP, CAST_USER_ADDR_T(kpath), UIO_SYSSPACE,
++	           buf, bufsize, UIO_USERSPACE, retval);
++}
++
++int
++herolte_linux_statat(vfs_context_t ctx, int fd, const char *kpath, int follow, struct stat64 *sb)
++{
++	struct nameidata nd;
++	int error;
+ 
++	NDINIT(&nd, LOOKUP, OP_GETATTR, (follow ? FOLLOW : NOFOLLOW) | AUDITVNPATH1,
++	    UIO_SYSSPACE, CAST_USER_ADDR_T(kpath), ctx);
++	error = nameiat(&nd, fd);
++	if (error) {
++		return error;
++	}
++	error = vn_stat(nd.ni_vp, sb, NULL, 1, 0, ctx);
++	vnode_put(nd.ni_vp);
++	nameidone(&nd);
+ 	return error;
+ }
++
++int
++herolte_linux_mkdirat(vfs_context_t ctx, int fd, const char *kpath, int mode)
++{
++	struct vnode_attr va;
++
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_mode, (mode & ACCESSPERMS) & ~vfs_context_proc(ctx)->p_fd.fd_cmask);
++	return mkdir1at(ctx, CAST_USER_ADDR_T(kpath), &va, fd, UIO_SYSSPACE);
++}
++
++int
++herolte_linux_unlinkat(vfs_context_t ctx, int fd, const char *kpath, int rmdir)
++{
++	if (rmdir) {
++		return rmdirat_internal(ctx, fd, CAST_USER_ADDR_T(kpath), UIO_SYSSPACE, 0);
++	}
++	return unlinkat_internal(ctx, fd, NULLVP, CAST_USER_ADDR_T(kpath), UIO_SYSSPACE, 0);
++}
+diff --git a/bsd/dev/herolte_linux.c b/bsd/dev/herolte_linux.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/herolte_linux.c
+@@ -0,0 +1,1200 @@
++/*
++ * HEROLTE: Linux arm64 system call personality for unmodified Android ELF
++ * programs (vendor lhd/gpsd, bionic), see HEROLTE_PROGRESS.md.
++ *
++ * A Darwin loader (linuxrun) maps the ELF and its interpreter, builds a Linux
++ * initial stack and calls linux_enter(pc, sp) (Darwin syscall 556). From then
++ * on the thread is a Linux thread: `svc #0` with the number in x8 comes here
++ * instead of unix_syscall(), results go back in x0 as value or -errno, and
++ * TPIDR_EL0 holds the thread's own TLS pointer (osfmk/arm64 cswitch/locore).
++ *
++ * Paths: absolute Linux paths are looked up under LX_ROOT, except iOS paths
++ * (/private/..., /var/...) and a few /dev nodes that exist on both systems.
++ *
++ * Gated by the boot-arg linuxabi=1; linuxtrace=1 logs unimplemented calls and
++ * program output, linuxtrace=2 every call (bounded).
++ */
++#include <kern/task.h>
++#include <kern/thread.h>
++#include <kern/assert.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/sched_prim.h>
++#include <kern/kalloc.h>
++#include <mach/machine/thread_status.h>
++#include <mach/thread_act.h>
++#include <machine/machine_routines.h>
++#include <arm64/proc_reg.h>
++#include <pexpert/pexpert.h>
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/kernel.h>
++#include <sys/proc_internal.h>
++#include <sys/file_internal.h>
++#include <sys/vnode_internal.h>
++#include <sys/user.h>
++#include <sys/errno.h>
++#include <sys/sysproto.h>
++#include <sys/kauth.h>
++#include <sys/stat.h>
++#include <sys/fcntl.h>
++#include <sys/mman.h>
++#include <sys/ulock.h>
++#include <sys/random.h>
++#include <sys/filio.h>
++#include <sys/wait.h>
++#include <libkern/OSAtomic.h>
++
++#define LX_ROOT "/private/var/herolte/linux/root"
++
++/* Must match struct herolte_linux_thread in osfmk/arm/thread.h. */
++struct hl_thread {
++	uint64_t abi;
++	uint64_t tls;
++	uint64_t clear_tid;
++	uint64_t robust_list;
++	int32_t  tid;
++	int32_t  nr;
++};
++extern void *herolte_linux_thread(thread_t);
++extern const size_t herolte_linux_thread_size;
++
++extern void *find_user_regs(thread_t);
++extern kern_return_t thread_create_immovable(task_t, thread_t *);
++extern kern_return_t thread_set_wq_state64(thread_t, thread_state_t);
++extern int get_task_numacts(task_t);
++extern void thread_exception_return(void) __dead2;
++
++void herolte_linux_syscall(arm_saved_state_t *, thread_t, struct proc *);
++void herolte_linux_syscall_return(int) __dead2;
++
++/* bsd/vfs/vfs_syscalls.c */
++extern int herolte_linux_openat(vfs_context_t, int, const char *, int, int, int *);
++extern int herolte_linux_faccessat(vfs_context_t, int, const char *, int);
++extern int herolte_linux_readlinkat(vfs_context_t, int, const char *, user_addr_t, size_t, int *);
++extern int herolte_linux_statat(vfs_context_t, int, const char *, int, struct stat64 *);
++extern int herolte_linux_mkdirat(vfs_context_t, int, const char *, int);
++extern int herolte_linux_unlinkat(vfs_context_t, int, const char *, int);
++
++static int lx_enabled = -1;
++static int lx_trace;
++static volatile SInt32 lx_trace_budget = 3000;
++static volatile SInt32 lx_unimpl_budget = 300;
++static volatile SInt32 lx_next_tid = 200000;
++
++/* Executable path per Linux process, for /proc/self/exe (bionic's linker
++ * stats and resolves it). Few Linux processes run at once. */
++#define LX_EXE_SLOTS 16
++static struct {
++	pid_t pid;
++	char path[MAXPATHLEN];
++} lx_exe[LX_EXE_SLOTS];
++static unsigned lx_exe_next;
++static LCK_GRP_DECLARE(lx_lck_grp, "herolte_linux");
++static LCK_MTX_DECLARE(lx_exe_mtx, &lx_lck_grp);
++
++static bool
++lx_exe_get(pid_t pid, char *out, size_t size)
++{
++	bool found = false;
++	lck_mtx_lock(&lx_exe_mtx);
++	for (unsigned i = 0; i < LX_EXE_SLOTS; i++) {
++		if (lx_exe[i].pid == pid) {
++			strlcpy(out, lx_exe[i].path, size);
++			found = true;
++			break;
++		}
++	}
++	lck_mtx_unlock(&lx_exe_mtx);
++	return found;
++}
++
++static void
++lx_exe_set(pid_t pid, const char *path)
++{
++	unsigned slot = LX_EXE_SLOTS;
++	lck_mtx_lock(&lx_exe_mtx);
++	for (unsigned i = 0; i < LX_EXE_SLOTS; i++) {
++		if (lx_exe[i].pid == pid) {
++			slot = i;
++		}
++	}
++	if (slot == LX_EXE_SLOTS) {
++		slot = lx_exe_next++ % LX_EXE_SLOTS;
++	}
++	lx_exe[slot].pid = pid;
++	strlcpy(lx_exe[slot].path, path, sizeof(lx_exe[slot].path));
++	lck_mtx_unlock(&lx_exe_mtx);
++}
++
++/* "/proc/self/exe" or "/proc/<own pid>/exe" */
++static bool
++lx_is_proc_exe(const char *p)
++{
++	char own[32];
++	if (!strcmp(p, "/proc/self/exe")) {
++		return true;
++	}
++	snprintf(own, sizeof(own), "/proc/%d/exe", proc_pid(current_proc()));
++	return !strcmp(p, own);
++}
++
++#define LXLOG(fmt, ...) printf("LINUXABI[%d] " fmt "\n", proc_pid(current_proc()), ##__VA_ARGS__)
++
++static struct hl_thread *
++lx_thread(thread_t th)
++{
++	return (struct hl_thread *)herolte_linux_thread(th);
++}
++
++/* Darwin errno -> Linux errno. 1..34 are identical. */
++static int
++lx_errno(int e)
++{
++	switch (e) {
++	case EDEADLK: return 35;
++	case EAGAIN: return 11;
++	case EINPROGRESS: return 115;
++	case EALREADY: return 114;
++	case ENOTSOCK: return 88;
++	case EDESTADDRREQ: return 89;
++	case EMSGSIZE: return 90;
++	case EPROTOTYPE: return 91;
++	case ENOPROTOOPT: return 92;
++	case EPROTONOSUPPORT: return 93;
++	case ESOCKTNOSUPPORT: return 94;
++	case ENOTSUP: return 95;
++	case EPFNOSUPPORT: return 96;
++	case EAFNOSUPPORT: return 97;
++	case EADDRINUSE: return 98;
++	case EADDRNOTAVAIL: return 99;
++	case ENETDOWN: return 100;
++	case ENETUNREACH: return 101;
++	case ENETRESET: return 102;
++	case ECONNABORTED: return 103;
++	case ECONNRESET: return 104;
++	case ENOBUFS: return 105;
++	case EISCONN: return 106;
++	case ENOTCONN: return 107;
++	case ESHUTDOWN: return 108;
++	case ETOOMANYREFS: return 109;
++	case ETIMEDOUT: return 110;
++	case ECONNREFUSED: return 111;
++	case ELOOP: return 40;
++	case ENAMETOOLONG: return 36;
++	case EHOSTDOWN: return 112;
++	case EHOSTUNREACH: return 113;
++	case ENOTEMPTY: return 39;
++	case EUSERS: return 87;
++	case EDQUOT: return 122;
++	case ESTALE: return 116;
++	case ENOLCK: return 37;
++	case ENOSYS: return 38;
++	case EOVERFLOW: return 75;
++	case ECANCELED: return 125;
++	case EIDRM: return 43;
++	case ENOMSG: return 42;
++	case EILSEQ: return 84;
++	case EBADMSG: return 74;
++	case EMULTIHOP: return 72;
++	case ENODATA: return 61;
++	case ENOLINK: return 67;
++	case ENOSR: return 63;
++	case ENOSTR: return 60;
++	case EPROTO: return 71;
++	case ETIME: return 62;
++	case ENOTRECOVERABLE: return 131;
++	case EOWNERDEAD: return 130;
++	default:
++		return (e > 0 && e <= 34) ? e : 22 /* EINVAL */;
++	}
++}
++
++#define LX_EPERM   1
++#define LX_ENOENT  2
++#define LX_EINTR   4
++#define LX_EBADF   9
++#define LX_EAGAIN  11
++#define LX_ENOMEM  12
++#define LX_EFAULT  14
++#define LX_EEXIST  17
++#define LX_EINVAL  22
++#define LX_ENOTTY  25
++#define LX_ERANGE  34
++#define LX_ENOSYS  38
++#define LX_ETIMEDOUT 110
++
++/* --- flag translation ---------------------------------------------------- */
++
++#define LX_AT_FDCWD            (-100)
++#define LX_AT_SYMLINK_NOFOLLOW 0x100
++#define LX_AT_REMOVEDIR        0x200
++#define LX_AT_EMPTY_PATH       0x1000
++
++static int
++lx_dirfd(int64_t fd)
++{
++	return (int)fd == LX_AT_FDCWD ? AT_FDCWD : (int)fd;
++}
++
++static int
++lx_open_flags(uint64_t lf)
++{
++	int f = (int)(lf & 3);
++	if (lf & 0x40) {
++		f |= O_CREAT;
++	}
++	if (lf & 0x80) {
++		f |= O_EXCL;
++	}
++	if (lf & 0x100) {
++		f |= O_NOCTTY;
++	}
++	if (lf & 0x200) {
++		f |= O_TRUNC;
++	}
++	if (lf & 0x400) {
++		f |= O_APPEND;
++	}
++	if (lf & 0x800) {
++		f |= O_NONBLOCK;
++	}
++	if (lf & 0x1000) {
++		f |= O_DSYNC;
++	}
++	if (lf & 0x4000) {
++		f |= O_DIRECTORY;
++	}
++	if (lf & 0x8000) {
++		f |= O_NOFOLLOW;
++	}
++	if (lf & 0x80000) {
++		f |= O_CLOEXEC;
++	}
++	return f;
++}
++
++static int64_t
++lx_from_darwin_fl(int df)
++{
++	int64_t lf = df & 3;
++	if (df & O_APPEND) {
++		lf |= 0x400;
++	}
++	if (df & O_NONBLOCK) {
++		lf |= 0x800;
++	}
++	if (df & O_DSYNC) {
++		lf |= 0x1000;
++	}
++	return lf;
++}
++
++/* --- paths ---------------------------------------------------------------- */
++
++static bool
++lx_passthrough(const char *p)
++{
++	static const char *const keep[] = {
++		"/private/", "/var/", "/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/tty",
++	};
++	for (unsigned i = 0; i < sizeof(keep) / sizeof(keep[0]); i++) {
++		if (!strncmp(p, keep[i], strlen(keep[i]))) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* Copy a Linux path in and rewrite it. *out is kalloc'ed MAXPATHLEN bytes.
++ * *is_exe tells readlinkat that the caller asked for /proc/self/exe. */
++static int
++lx_path_ex(user_addr_t upath, char **out, bool *is_exe)
++{
++	char *in, *res;
++	size_t len = 0;
++	int error;
++
++	in = kalloc_data(MAXPATHLEN, Z_WAITOK);
++	res = kalloc_data(MAXPATHLEN, Z_WAITOK);
++	if (!in || !res) {
++		kfree_data(in, MAXPATHLEN);
++		kfree_data(res, MAXPATHLEN);
++		return ENOMEM;
++	}
++	error = copyinstr(upath, in, MAXPATHLEN, &len);
++	if (is_exe) {
++		*is_exe = false;
++	}
++	if (!error) {
++		if (lx_is_proc_exe(in)) {
++			if (lx_exe_get(proc_pid(current_proc()), res, MAXPATHLEN)) {
++				if (is_exe) {
++					*is_exe = true;
++				}
++			} else {
++				error = ENOENT;
++			}
++		} else if (in[0] != '/' || lx_passthrough(in)) {
++			strlcpy(res, in, MAXPATHLEN);
++		} else if (strlen(LX_ROOT) + strlen(in) >= MAXPATHLEN) {
++			error = ENAMETOOLONG;
++		} else {
++			strlcpy(res, LX_ROOT, MAXPATHLEN);
++			strlcat(res, in, MAXPATHLEN);
++		}
++	}
++	kfree_data(in, MAXPATHLEN);
++	if (error) {
++		kfree_data(res, MAXPATHLEN);
++		return error;
++	}
++	*out = res;
++	return 0;
++}
++
++static int
++lx_path(user_addr_t upath, char **out)
++{
++	return lx_path_ex(upath, out, NULL);
++}
++
++static void
++lx_path_free(char *p)
++{
++	kfree_data(p, MAXPATHLEN);
++}
++
++/* --- stat ----------------------------------------------------------------- */
++
++struct lx_stat {
++	uint64_t st_dev;
++	uint64_t st_ino;
++	uint32_t st_mode;
++	uint32_t st_nlink;
++	uint32_t st_uid;
++	uint32_t st_gid;
++	uint64_t st_rdev;
++	uint64_t pad1;
++	int64_t  st_size;
++	int32_t  st_blksize;
++	int32_t  pad2;
++	int64_t  st_blocks;
++	int64_t  st_atime_sec;
++	int64_t  st_atime_nsec;
++	int64_t  st_mtime_sec;
++	int64_t  st_mtime_nsec;
++	int64_t  st_ctime_sec;
++	int64_t  st_ctime_nsec;
++	uint32_t unused[2];
++};
++_Static_assert(sizeof(struct lx_stat) == 128, "Linux arm64 struct stat");
++
++static int
++lx_copyout_stat(const struct stat64 *sb, user_addr_t ub)
++{
++	struct lx_stat ls = {
++		.st_dev = (uint32_t)sb->st_dev,
++		.st_ino = sb->st_ino,
++		.st_mode = sb->st_mode,
++		.st_nlink = sb->st_nlink,
++		.st_uid = sb->st_uid,
++		.st_gid = sb->st_gid,
++		.st_rdev = (uint32_t)sb->st_rdev,
++		.st_size = sb->st_size,
++		.st_blksize = sb->st_blksize,
++		.st_blocks = sb->st_blocks,
++		.st_atime_sec = sb->st_atimespec.tv_sec,
++		.st_atime_nsec = sb->st_atimespec.tv_nsec,
++		.st_mtime_sec = sb->st_mtimespec.tv_sec,
++		.st_mtime_nsec = sb->st_mtimespec.tv_nsec,
++		.st_ctime_sec = sb->st_ctimespec.tv_sec,
++		.st_ctime_nsec = sb->st_ctimespec.tv_nsec,
++	};
++	return copyout(&ls, ub, sizeof(ls));
++}
++
++static int
++lx_fstat_fd(proc_t p, int fd, struct stat64 *sb)
++{
++	struct fileproc *fp;
++	int error = fp_lookup(p, fd, &fp, 0);
++	if (error) {
++		return error;
++	}
++	bzero(sb, sizeof(*sb));
++	switch (FILEGLOB_DTYPE(fp->fp_glob)) {
++	case DTYPE_VNODE: {
++		vnode_t vp = (vnode_t)fp_get_data(fp);
++		error = vnode_getwithref(vp);
++		if (!error) {
++			error = vn_stat(vp, sb, NULL, 1, 0, vfs_context_current());
++			vnode_put(vp);
++		}
++		break;
++	}
++	case DTYPE_SOCKET:
++		sb->st_mode = S_IFSOCK | 0777;
++		sb->st_blksize = 4096;
++		break;
++	case DTYPE_PIPE:
++		sb->st_mode = S_IFIFO | 0600;
++		sb->st_blksize = 4096;
++		break;
++	default:
++		sb->st_mode = S_IFCHR | 0600;
++		break;
++	}
++	fp_drop(p, fd, fp, 0);
++	return error;
++}
++
++/* --- time ----------------------------------------------------------------- */
++
++struct lx_timespec {
++	int64_t tv_sec;
++	int64_t tv_nsec;
++};
++
++static void
++lx_clock(int clk, struct lx_timespec *ts)
++{
++	uint64_t ns;
++	if (clk == 0 || clk == 5 || clk == 8) {         /* REALTIME, _COARSE, _ALARM */
++		struct timespec now;
++		nanotime(&now);
++		ts->tv_sec = now.tv_sec;
++		ts->tv_nsec = now.tv_nsec;
++		return;
++	}
++	if (clk == 7 || clk == 9) {                     /* BOOTTIME (incl. sleep) */
++		absolutetime_to_nanoseconds(mach_continuous_time(), &ns);
++	} else {                                        /* MONOTONIC*, CPUTIME approx. */
++		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	}
++	ts->tv_sec = (int64_t)(ns / NSEC_PER_SEC);
++	ts->tv_nsec = (int64_t)(ns % NSEC_PER_SEC);
++}
++
++/* Interruptible sleep until deadline (mach absolute time). */
++static int
++lx_sleep_until(uint64_t deadline)
++{
++	int event;
++	wait_result_t wr = assert_wait_deadline(&event, THREAD_ABORTSAFE, deadline);
++	if (wr == THREAD_WAITING) {
++		wr = thread_block(THREAD_CONTINUE_NULL);
++	}
++	return wr == THREAD_INTERRUPTED ? EINTR : 0;
++}
++
++static int64_t
++lx_nanosleep(int clk, int flags, user_addr_t ureq)
++{
++	struct lx_timespec req, now;
++	uint64_t ns, deadline, interval;
++	if (copyin(ureq, &req, sizeof(req))) {
++		return -LX_EFAULT;
++	}
++	if (req.tv_sec < 0 || req.tv_nsec < 0 || req.tv_nsec >= (int64_t)NSEC_PER_SEC) {
++		return -LX_EINVAL;
++	}
++	ns = (uint64_t)req.tv_sec * NSEC_PER_SEC + (uint64_t)req.tv_nsec;
++	if (flags & 1) {                                /* TIMER_ABSTIME */
++		uint64_t cur;
++		lx_clock(clk, &now);
++		cur = (uint64_t)now.tv_sec * NSEC_PER_SEC + (uint64_t)now.tv_nsec;
++		ns = ns > cur ? ns - cur : 0;
++	}
++	nanoseconds_to_absolutetime(ns, &interval);
++	clock_absolutetime_interval_to_deadline(interval, &deadline);
++	return lx_sleep_until(deadline) ? -LX_EINTR : 0;
++}
++
++/* --- futex ----------------------------------------------------------------- */
++
++static int64_t
++lx_futex(proc_t p, struct uthread *ut, user_addr_t uaddr, int op, uint32_t val, user_addr_t utime)
++{
++	int cmd = op & 0x7f;
++	int error;
++	if (cmd == 0 || cmd == 9) {                     /* FUTEX_WAIT, FUTEX_WAIT_BITSET */
++		struct ulock_wait_args ua = {
++			.operation = UL_COMPARE_AND_WAIT,
++			.addr = uaddr,
++			.value = val,
++			.timeout = 0,
++		};
++		if (utime) {
++			struct lx_timespec ts;
++			uint64_t us;
++			if (copyin(utime, &ts, sizeof(ts))) {
++				return -LX_EFAULT;
++			}
++			if (cmd == 9) {                         /* absolute */
++				struct lx_timespec now;
++				int64_t d;
++				lx_clock((op & 256) ? 0 : 1, &now);
++				d = (ts.tv_sec - now.tv_sec) * 1000000 + (ts.tv_nsec - now.tv_nsec) / 1000;
++				if (d <= 0) {
++					return -LX_ETIMEDOUT;
++				}
++				us = (uint64_t)d;
++			} else {
++				us = (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
++				if (us == 0) {
++					us = 1;
++				}
++			}
++			ua.timeout = us > UINT32_MAX ? UINT32_MAX : (uint32_t)us;
++		}
++		error = sys_ulock_wait(p, &ua, (int *)&ut->uu_rval[0]);
++		/* A changed value returns at once with success; bionic retries. */
++		return error ? -lx_errno(error) : 0;
++	}
++	if (cmd == 1 || cmd == 10) {                    /* FUTEX_WAKE, FUTEX_WAKE_BITSET */
++		struct ulock_wake_args wa = {
++			.operation = UL_COMPARE_AND_WAIT | (val > 1 ? ULF_WAKE_ALL : 0),
++			.addr = uaddr,
++			.wake_value = 0,
++		};
++		if (val == 0) {
++			return 0;
++		}
++		error = sys_ulock_wake(p, &wa, (int *)&ut->uu_rval[0]);
++		return error == 0 ? 1 : 0;              /* ENOENT: nobody waiting */
++	}
++	return -LX_ENOSYS;
++}
++
++/* --- threads and exit ------------------------------------------------------ */
++
++#define LX_CLONE_VM             0x00000100
++#define LX_CLONE_THREAD         0x00010000
++#define LX_CLONE_SETTLS         0x00080000
++#define LX_CLONE_PARENT_SETTID  0x00100000
++#define LX_CLONE_CHILD_CLEARTID 0x00200000
++#define LX_CLONE_CHILD_SETTID   0x01000000
++
++static int64_t
++lx_clone(arm_saved_state_t *state, uint64_t flags, user_addr_t newsp, user_addr_t ptid,
++    uint64_t tls, user_addr_t ctid)
++{
++	struct arm_saved_state64 *ps = saved_state64(state);
++	arm_thread_state64_t ts = {};
++	struct hl_thread *child;
++	thread_t th;
++	int32_t tid;
++
++	if ((flags & (LX_CLONE_VM | LX_CLONE_THREAD)) != (LX_CLONE_VM | LX_CLONE_THREAD)) {
++		LXLOG("clone flags %#llx (process) unsupported", flags);
++		return -LX_ENOSYS;
++	}
++	if (thread_create_immovable(current_task(), &th) != KERN_SUCCESS) {
++		return -LX_EAGAIN;
++	}
++	for (int i = 0; i < 29; i++) {
++		ts.x[i] = ps->x[i];
++	}
++	ts.x[0] = 0;
++	ts.fp = ps->fp;
++	ts.lr = ps->lr;
++	ts.sp = newsp ? newsp : ps->sp;
++	ts.pc = ps->pc;
++	ts.cpsr = ps->cpsr;
++	(void)thread_set_wq_state64(th, (thread_state_t)&ts);
++
++	tid = OSIncrementAtomic(&lx_next_tid);
++	child = lx_thread(th);
++	child->tls = (flags & LX_CLONE_SETTLS) ? tls : __builtin_arm_rsr64("TPIDR_EL0");
++	child->tid = tid;
++	child->clear_tid = (flags & LX_CLONE_CHILD_CLEARTID) ? ctid : 0;
++	child->robust_list = 0;
++	child->abi = 1;
++	if (flags & LX_CLONE_PARENT_SETTID) {
++		(void)copyout(&tid, ptid, sizeof(tid));
++	}
++	if (flags & LX_CLONE_CHILD_SETTID) {
++		(void)copyout(&tid, ctid, sizeof(tid));
++	}
++	thread_resume(th);
++	thread_deallocate(th);
++	return tid;
++}
++
++static void
++lx_clear_child_tid(proc_t p, struct uthread *ut, struct hl_thread *lt)
++{
++	if (lt->clear_tid) {
++		int32_t zero = 0;
++		if (!copyout(&zero, lt->clear_tid, sizeof(zero))) {
++			(void)lx_futex(p, ut, lt->clear_tid, 1, INT32_MAX, 0);
++		}
++		lt->clear_tid = 0;
++	}
++}
++
++__dead2 static void
++lx_exit_group(proc_t p, int code)
++{
++	struct exit_args ea = { .rval = code & 0xff };
++	int32_t rv;
++	if (lx_trace) {
++		LXLOG("exit_group(%d)", code & 0xff);
++	}
++	exit(p, &ea, &rv);
++	__builtin_unreachable();
++}
++
++/* --- misc ------------------------------------------------------------------ */
++
++struct lx_utsname {
++	char sysname[65], nodename[65], release[65], version[65], machine[65], domainname[65];
++};
++
++static int64_t
++lx_uname(user_addr_t ub)
++{
++	struct lx_utsname u = {};
++	strlcpy(u.sysname, "Linux", sizeof(u.sysname));
++	strlcpy(u.nodename, "localhost", sizeof(u.nodename));
++	strlcpy(u.release, "4.14.0-herolte", sizeof(u.release));
++	strlcpy(u.version, "#1 SMP PREEMPT", sizeof(u.version));
++	strlcpy(u.machine, "aarch64", sizeof(u.machine));
++	strlcpy(u.domainname, "(none)", sizeof(u.domainname));
++	return copyout(&u, ub, sizeof(u)) ? -LX_EFAULT : 0;
++}
++
++struct lx_statfs {
++	int64_t f_type, f_bsize;
++	uint64_t f_blocks, f_bfree, f_bavail, f_files, f_ffree;
++	int32_t f_fsid[2];
++	int64_t f_namelen, f_frsize, f_flags, f_spare[4];
++};
++
++static int64_t
++lx_fake_statfs(user_addr_t ub)
++{
++	struct lx_statfs s = {
++		.f_type = 0xEF53, .f_bsize = 4096, .f_blocks = 1 << 20, .f_bfree = 1 << 19,
++		.f_bavail = 1 << 19, .f_files = 1 << 16, .f_ffree = 1 << 15, .f_namelen = 255,
++		.f_frsize = 4096,
++	};
++	return copyout(&s, ub, sizeof(s)) ? -LX_EFAULT : 0;
++}
++
++static int64_t
++lx_getrandom(user_addr_t ub, uint64_t len)
++{
++	uint8_t buf[256];
++	uint64_t done = 0;
++	while (done < len) {
++		u_int n = (u_int)MIN(len - done, sizeof(buf));
++		read_random(buf, n);
++		if (copyout(buf, ub + done, n)) {
++			return done ? (int64_t)done : -LX_EFAULT;
++		}
++		done += n;
++	}
++	return (int64_t)len;
++}
++
++static int64_t
++lx_mmap(proc_t p, uint64_t addr, uint64_t len, int prot, uint64_t lflags, int fd, uint64_t off)
++{
++	struct mmap_args ma = {};
++	user_addr_t rv = 0;
++	int flags = 0, error;
++	bool noreplace = (lflags & 0x100000) != 0;
++
++	switch (lflags & 0xf) {
++	case 1: flags = MAP_SHARED; break;
++	case 2: flags = MAP_PRIVATE; break;
++	case 3: flags = MAP_SHARED; break;      /* MAP_SHARED_VALIDATE */
++	default: return -LX_EINVAL;
++	}
++	if (lflags & 0x10) {
++		flags |= MAP_FIXED;
++	}
++	if (lflags & 0x20) {
++		flags |= MAP_ANON;
++		fd = -1;
++	}
++	ma.addr = addr;
++	ma.len = len;
++	ma.prot = prot & (PROT_READ | PROT_WRITE | PROT_EXEC);
++	ma.flags = flags;
++	ma.fd = fd;
++	ma.pos = (off_t)off;
++	error = mmap(p, &ma, &rv);
++	if (error) {
++		return -lx_errno(error);
++	}
++	if (noreplace && addr && rv != addr) {
++		struct munmap_args mu = { .addr = rv, .len = len };
++		int32_t r;
++		(void)munmap(p, &mu, &r);
++		return -LX_EEXIST;
++	}
++	return (int64_t)rv;
++}
++
++static int64_t
++lx_fcntl(proc_t p, int fd, int cmd, uint64_t arg)
++{
++	struct fcntl_args fa = { .fd = fd, .arg = arg };
++	int32_t rv = 0;
++	int error;
++	switch (cmd) {
++	case 0: fa.cmd = F_DUPFD; break;
++	case 1: fa.cmd = F_GETFD; break;
++	case 2: fa.cmd = F_SETFD; break;
++	case 3: fa.cmd = F_GETFL; break;
++	case 4: fa.cmd = F_SETFL; fa.arg = (uint64_t)lx_open_flags(arg) & ~(uint64_t)O_ACCMODE; break;
++	case 1030: fa.cmd = F_DUPFD_CLOEXEC; break;
++	case 5: case 6: case 7:                 /* F_GETLK/F_SETLK/F_SETLKW: single user */
++		if (cmd == 5) {
++			int16_t unlck = 2;              /* F_UNLCK in l_type (first field) */
++			(void)copyout(&unlck, arg, sizeof(unlck));
++		}
++		return 0;
++	default:
++		return -LX_EINVAL;
++	}
++	error = sys_fcntl(p, &fa, &rv);
++	if (error) {
++		return -lx_errno(error);
++	}
++	return cmd == 3 ? lx_from_darwin_fl(rv) : rv;
++}
++
++static int64_t
++lx_ioctl(proc_t p, int fd, uint64_t cmd, uint64_t arg)
++{
++	struct ioctl_args ia = { .fd = fd, .data = arg };
++	int32_t rv;
++	int error;
++	switch (cmd) {
++	case 0x5421: ia.com = FIONBIO; break;
++	case 0x541B: ia.com = FIONREAD; break;
++	default:
++		return -LX_ENOTTY;
++	}
++	error = ioctl(p, &ia, &rv);
++	return error ? -lx_errno(error) : 0;
++}
++
++/* --- dispatcher ------------------------------------------------------------ */
++
++static int64_t
++lx_dispatch(arm_saved_state_t *state, thread_t th, proc_t p, struct uthread *ut,
++    struct hl_thread *lt, int nr, const uint64_t *a)
++{
++	vfs_context_t ctx = vfs_context_current();
++	char *kp = NULL;
++	int error = 0;
++	int32_t ival = 0;
++	user_ssize_t sval = 0;
++	struct stat64 sb;
++
++	switch (nr) {
++	case 17: {                                      /* getcwd */
++		static const char cwd[] = "/";
++		if (a[1] < sizeof(cwd)) {
++			return -LX_ERANGE;
++		}
++		return copyout(cwd, a[0], sizeof(cwd)) ? -LX_EFAULT : (int64_t)sizeof(cwd);
++	}
++	case 23: {                                      /* dup */
++		struct dup_args da = { .fd = (u_int)a[0] };
++		error = sys_dup(p, &da, &ival);
++		return error ? -lx_errno(error) : ival;
++	}
++	case 24: {                                      /* dup3 */
++		struct dup2_args da = { .from = (u_int)a[0], .to = (u_int)a[1] };
++		error = sys_dup2(p, &da, &ival);
++		if (!error && (a[2] & 0x80000)) {
++			(void)lx_fcntl(p, (int)a[1], 2, 1);
++		}
++		return error ? -lx_errno(error) : ival;
++	}
++	case 25:                                        /* fcntl */
++		return lx_fcntl(p, (int)a[0], (int)a[1], a[2]);
++	case 29:                                        /* ioctl */
++		return lx_ioctl(p, (int)a[0], a[1], a[2]);
++	case 34:                                        /* mkdirat */
++		if ((error = lx_path(a[1], &kp)) == 0) {
++			error = herolte_linux_mkdirat(ctx, lx_dirfd(a[0]), kp, (int)a[2]);
++			lx_path_free(kp);
++		}
++		return error ? -lx_errno(error) : 0;
++	case 35:                                        /* unlinkat */
++		if ((error = lx_path(a[1], &kp)) == 0) {
++			error = herolte_linux_unlinkat(ctx, lx_dirfd(a[0]), kp, (a[2] & LX_AT_REMOVEDIR) != 0);
++			lx_path_free(kp);
++		}
++		return error ? -lx_errno(error) : 0;
++	case 43:                                        /* statfs */
++	case 44:                                        /* fstatfs */
++		return lx_fake_statfs(a[1]);
++	case 48:                                        /* faccessat */
++	case 439:                                       /* faccessat2 */
++		if ((error = lx_path(a[1], &kp)) == 0) {
++			error = herolte_linux_faccessat(ctx, lx_dirfd(a[0]), kp, (int)a[2] & 7);
++			lx_path_free(kp);
++		}
++		return error ? -lx_errno(error) : 0;
++	case 56:                                        /* openat */
++		if ((error = lx_path(a[1], &kp)) == 0) {
++			error = herolte_linux_openat(ctx, lx_dirfd(a[0]), kp, lx_open_flags(a[2]),
++			    (int)a[3], &ival);
++			if (lx_trace >= 2 || (error && lx_trace)) {
++				LXLOG("openat %s -> %d", kp, error ? -lx_errno(error) : ival);
++			}
++			lx_path_free(kp);
++		}
++		return error ? -lx_errno(error) : ival;
++	case 57: {                                      /* close */
++		struct close_args ca = { .fd = (int)a[0] };
++		error = sys_close(p, &ca, &ival);
++		return error ? -lx_errno(error) : 0;
++	}
++	case 62: {                                      /* lseek */
++		struct lseek_args la = { .fd = (int)a[0], .offset = (off_t)a[1], .whence = (int)a[2] };
++		off_t off = 0;
++		error = lseek(p, &la, &off);
++		return error ? -lx_errno(error) : (int64_t)off;
++	}
++	case 63: {                                      /* read */
++		struct read_args ra = { .fd = (int)a[0], .cbuf = a[1], .nbyte = a[2] };
++		error = read(p, &ra, &sval);
++		return error ? -lx_errno(error) : sval;
++	}
++	case 64: {                                      /* write */
++		struct write_args wa = { .fd = (int)a[0], .cbuf = a[1], .nbyte = a[2] };
++		if (lx_trace && (a[0] == 1 || a[0] == 2)) {
++			char line[161];
++			size_t n = MIN(a[2], sizeof(line) - 1);
++			if (!copyin(a[1], line, n)) {
++				line[n] = 0;
++				if (n && line[n - 1] == '\n') {
++					line[n - 1] = 0;
++				}
++				LXLOG("out%d: %s", (int)a[0], line);
++			}
++		}
++		error = write(p, &wa, &sval);
++		return error ? -lx_errno(error) : sval;
++	}
++	case 65: {                                      /* readv */
++		struct readv_args ra = { .fd = (int)a[0], .iovp = a[1], .iovcnt = (u_int)a[2] };
++		error = readv(p, &ra, &sval);
++		return error ? -lx_errno(error) : sval;
++	}
++	case 66: {                                      /* writev */
++		struct writev_args wa = { .fd = (int)a[0], .iovp = a[1], .iovcnt = (u_int)a[2] };
++		error = writev(p, &wa, &sval);
++		return error ? -lx_errno(error) : sval;
++	}
++	case 67: {                                      /* pread64 */
++		struct pread_args pa = { .fd = (int)a[0], .buf = a[1], .nbyte = a[2], .offset = (off_t)a[3] };
++		error = pread(p, &pa, &sval);
++		return error ? -lx_errno(error) : sval;
++	}
++	case 68: {                                      /* pwrite64 */
++		struct pwrite_args pa = { .fd = (int)a[0], .buf = a[1], .nbyte = a[2], .offset = (off_t)a[3] };
++		error = pwrite(p, &pa, &sval);
++		return error ? -lx_errno(error) : sval;
++	}
++	case 78: {                                      /* readlinkat */
++		bool is_exe;
++		if ((error = lx_path_ex(a[1], &kp, &is_exe)) == 0) {
++			if (is_exe) {
++				size_t n = MIN(strlen(kp), a[3]);
++				error = copyout(kp, a[2], n);
++				ival = (int32_t)n;
++			} else {
++				error = herolte_linux_readlinkat(ctx, lx_dirfd(a[0]), kp, a[2], a[3], &ival);
++			}
++			lx_path_free(kp);
++		}
++		return error ? -lx_errno(error) : ival;
++	}
++	case 79: {                                      /* newfstatat */
++		char empty = 1;
++		if (a[3] & LX_AT_EMPTY_PATH) {
++			(void)copyin(a[1], &empty, 1);
++		}
++		if ((a[3] & LX_AT_EMPTY_PATH) && empty == 0) {
++			error = lx_fstat_fd(p, (int)a[0], &sb);
++		} else if ((error = lx_path(a[1], &kp)) == 0) {
++			error = herolte_linux_statat(ctx, lx_dirfd(a[0]), kp,
++			    !(a[3] & LX_AT_SYMLINK_NOFOLLOW), &sb);
++			lx_path_free(kp);
++		}
++		if (error) {
++			return -lx_errno(error);
++		}
++		return lx_copyout_stat(&sb, a[2]) ? -LX_EFAULT : 0;
++	}
++	case 80:                                        /* fstat */
++		error = lx_fstat_fd(p, (int)a[0], &sb);
++		if (error) {
++			return -lx_errno(error);
++		}
++		return lx_copyout_stat(&sb, a[1]) ? -LX_EFAULT : 0;
++	case 93:                                        /* exit (thread) */
++		lx_clear_child_tid(p, ut, lt);
++		if (get_task_numacts(current_task()) <= 1) {
++			lx_exit_group(p, (int)a[0]);
++		}
++		lt->abi = 0;
++		thread_terminate(th);
++		return 0;
++	case 94:                                        /* exit_group */
++		lx_exit_group(p, (int)a[0]);
++	case 96:                                        /* set_tid_address */
++		lt->clear_tid = a[0];
++		return lt->tid;
++	case 98:                                        /* futex */
++		return lx_futex(p, ut, a[0], (int)a[1], (uint32_t)a[2], a[3]);
++	case 99:                                        /* set_robust_list */
++		lt->robust_list = a[0];
++		return 0;
++	case 101:                                       /* nanosleep */
++		return lx_nanosleep(1, 0, a[0]);
++	case 113: {                                     /* clock_gettime */
++		struct lx_timespec ts;
++		lx_clock((int)a[0], &ts);
++		return copyout(&ts, a[1], sizeof(ts)) ? -LX_EFAULT : 0;
++	}
++	case 114: {                                     /* clock_getres */
++		struct lx_timespec ts = { 0, 1 };
++		return (a[1] && copyout(&ts, a[1], sizeof(ts))) ? -LX_EFAULT : 0;
++	}
++	case 115:                                       /* clock_nanosleep */
++		return lx_nanosleep((int)a[0], (int)a[1], a[2]);
++	case 120:                                       /* sched_getscheduler */
++	case 121:                                       /* sched_getparam */
++	case 124:                                       /* sched_yield */
++	case 140:                                       /* setpriority */
++	case 141:                                       /* getpriority */
++		return 0;
++	case 123: {                                     /* sched_getaffinity */
++		uint64_t mask = 0xff;
++		if (a[1] < sizeof(mask)) {
++			return -LX_EINVAL;
++		}
++		return copyout(&mask, a[2], sizeof(mask)) ? -LX_EFAULT : (int64_t)sizeof(mask);
++	}
++	case 129:                                       /* kill */
++	case 130:                                       /* tkill */
++	case 131:                                       /* tgkill */
++		return 0;                               /* no Linux signals yet */
++	case 132:                                       /* sigaltstack */
++		if (a[1]) {
++			struct { uint64_t sp; int32_t flags; int32_t pad; uint64_t size; } old = { 0, 2, 0, 0 };
++			if (copyout(&old, a[1], sizeof(old))) {
++				return -LX_EFAULT;
++			}
++		}
++		return 0;
++	case 134:                                       /* rt_sigaction */
++		if (a[2]) {
++			uint64_t zero[4] = {};
++			if (copyout(zero, a[2], sizeof(zero))) {
++				return -LX_EFAULT;
++			}
++		}
++		return 0;
++	case 135:                                       /* rt_sigprocmask */
++		if (a[2]) {
++			uint64_t zero = 0;
++			if (copyout(&zero, a[2], sizeof(zero))) {
++				return -LX_EFAULT;
++			}
++		}
++		return 0;
++	case 160:                                       /* uname */
++		return lx_uname(a[0]);
++	case 166: {                                     /* umask */
++		struct umask_args ua = { .newmask = (int)a[0] };
++		error = umask(p, &ua, &ival);
++		return error ? -lx_errno(error) : ival;
++	}
++	case 167:                                       /* prctl */
++		switch (a[0]) {
++		case 3:                                 /* PR_GET_DUMPABLE */
++			return 1;
++		case 4:                                 /* PR_SET_DUMPABLE */
++		case 15:                                /* PR_SET_NAME */
++		case 38:                                /* PR_SET_NO_NEW_PRIVS */
++			return 0;
++		case 16: {                              /* PR_GET_NAME */
++			char name[16] = {};
++			strlcpy(name, p->p_comm, sizeof(name));
++			return copyout(name, a[1], sizeof(name)) ? -LX_EFAULT : 0;
++		}
++		default:                                /* PR_SET_VMA and others */
++			return -LX_EINVAL;
++		}
++	case 172:                                       /* getpid */
++		return proc_pid(p);
++	case 173:                                       /* getppid */
++		return proc_ppid(p);
++	case 174:                                       /* getuid */
++		return kauth_getruid();
++	case 175:                                       /* geteuid */
++		return kauth_getuid();
++	case 176:                                       /* getgid */
++		return kauth_getrgid();
++	case 177:                                       /* getegid */
++		return kauth_getgid();
++	case 178:                                       /* gettid */
++		return lt->tid;
++	case 215: {                                     /* munmap */
++		struct munmap_args mu = { .addr = a[0], .len = a[1] };
++		error = munmap(p, &mu, &ival);
++		return error ? -lx_errno(error) : 0;
++	}
++	case 220:                                       /* clone */
++		return lx_clone(state, a[0], a[1], a[2], a[3], a[4]);
++	case 222:                                       /* mmap */
++		return lx_mmap(p, a[0], a[1], (int)a[2], a[3], (int)a[4], a[5]);
++	case 226: {                                     /* mprotect */
++		struct mprotect_args ma = { .addr = a[0], .len = a[1], .prot = (int)a[2] & 7 };
++		error = mprotect(p, &ma, &ival);
++		return error ? -lx_errno(error) : 0;
++	}
++	case 233:                                       /* madvise */
++		return 0;
++	case 261:                                       /* prlimit64 */
++		if (a[3]) {
++			uint64_t lim[2] = { 8 << 20, UINT64_MAX };
++			if (a[1] == 7) {                        /* RLIMIT_NOFILE */
++				lim[0] = lim[1] = 1024;
++			}
++			if (copyout(lim, a[3], sizeof(lim))) {
++				return -LX_EFAULT;
++			}
++		}
++		return 0;
++	case 278:                                       /* getrandom */
++		return lx_getrandom(a[0], a[1]);
++	default:
++		if (OSDecrementAtomic(&lx_unimpl_budget) > 0) {
++			LXLOG("unimplemented nr %d (%#llx, %#llx, %#llx) pc %#llx", nr, a[0], a[1], a[2],
++			    saved_state64(state)->pc);
++		}
++		return -LX_ENOSYS;
++	}
++}
++
++void
++herolte_linux_syscall(arm_saved_state_t *state, thread_t th, struct proc *p)
++{
++	struct arm_saved_state64 *ss = saved_state64(state);
++	struct uthread *ut = get_bsdthread_info(th);
++	struct hl_thread *lt = lx_thread(th);
++	uint64_t a[6] = { ss->x[0], ss->x[1], ss->x[2], ss->x[3], ss->x[4], ss->x[5] };
++	int nr = (int)ss->x[8];
++	int64_t ret;
++
++	lt->nr = nr;
++	ut->uu_flag |= UT_NOTCANCELPT;
++	ut->syscall_code = 0;
++	ut->uu_rval[0] = ut->uu_rval[1] = 0;
++
++	ret = lx_dispatch(state, th, p, ut, lt, nr, a);
++
++	if (lx_trace >= 2 && OSDecrementAtomic(&lx_trace_budget) > 0) {
++		LXLOG("tid %d nr %d (%#llx, %#llx, %#llx) = %lld", lt->tid, nr, a[0], a[1], a[2], ret);
++	}
++	ss->x[0] = (uint64_t)ret;
++	ut->uu_flag &= ~UT_NOTCANCELPT;
++}
++
++/* Continuation return (ulock_wait, select, ...): see unix_syscall_return(). */
++void
++herolte_linux_syscall_return(int error)
++{
++	thread_t th = current_thread();
++	struct uthread *ut = get_bsdthread_info(th);
++	struct hl_thread *lt = lx_thread(th);
++	struct arm_saved_state64 *ss = saved_state64((arm_saved_state_t *)find_user_regs(th));
++
++	if (error == ERESTART) {
++		ss->pc -= 4;
++	} else if (error != EJUSTRETURN) {
++		int64_t ret;
++		if (error) {
++			ret = -lx_errno(error);
++		} else if (lt->nr == 98) {              /* futex wait woke */
++			ret = 0;
++		} else {
++			ret = (int64_t)ut->uu_rval[0];
++		}
++		ss->x[0] = (uint64_t)ret;
++	}
++	ut->uu_flag &= ~UT_NOTCANCELPT;
++	ut->syscall_code = 0;
++	thread_exception_return();
++}
++
++/* Darwin syscall 556: become a Linux thread at pc with stack sp. */
++int
++linux_enter(proc_t p, struct linux_enter_args *uap, __unused int32_t *retval)
++{
++	thread_t th = current_thread();
++	struct hl_thread *lt = lx_thread(th);
++	struct arm_saved_state64 *ss;
++	int enabled = 0;
++	char *exe;
++	size_t len = 0;
++
++	if (lx_enabled < 0) {
++		PE_parse_boot_argn("linuxtrace", &lx_trace, sizeof(lx_trace));
++		lx_enabled = PE_parse_boot_argn("linuxabi", &enabled, sizeof(enabled)) && enabled == 1;
++	}
++	if (!lx_enabled) {
++		return ENOSYS;
++	}
++	if (herolte_linux_thread_size != sizeof(struct hl_thread)) {
++		printf("LINUXABI: thread state size mismatch %lu != %lu\n",
++		    (unsigned long)herolte_linux_thread_size, sizeof(struct hl_thread));
++		return ENOSYS;
++	}
++	if (get_task_numacts(current_task()) != 1) {
++		return EBUSY;                           /* single-threaded loaders only */
++	}
++	exe = kalloc_data(MAXPATHLEN, Z_WAITOK);
++	if (!exe) {
++		return ENOMEM;
++	}
++	if (copyinstr(uap->exe, exe, MAXPATHLEN, &len) || exe[0] != '/') {
++		kfree_data(exe, MAXPATHLEN);
++		return EINVAL;
++	}
++	lx_exe_set(proc_pid(p), exe);
++	kfree_data(exe, MAXPATHLEN);
++
++	ss = saved_state64((arm_saved_state_t *)find_user_regs(th));
++	for (int i = 0; i < 29; i++) {
++		ss->x[i] = 0;
++	}
++	ss->fp = 0;
++	ss->lr = 0;
++	ss->sp = uap->sp;
++	ss->pc = uap->pc;
++	ss->cpsr &= ~(uint32_t)PSR64_NZCV_MASK;
++
++	lt->tls = 0;
++	lt->clear_tid = 0;
++	lt->robust_list = 0;
++	lt->tid = proc_pid(p);
++	lt->abi = 1;
++	__builtin_arm_wsr64("TPIDR_EL0", 0);
++	printf("LINUXABI[%d] enter %s pc %#llx sp %#llx\n", proc_pid(p), p->p_comm, uap->pc, uap->sp);
++	return EJUSTRETURN;
++}
